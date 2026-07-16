@@ -3,3 +3,5 @@ token.json/
 bin/
 obj/
 .vs/
+*.csproj.user
+*.suo
