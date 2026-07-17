@@ -14,6 +14,14 @@ public sealed class DriveFileInfo
 
     public DateTimeOffset? ModifiedTime { get; init; }
 
+    public DateTimeOffset? CreatedTime { get; init; }
+
+    public IReadOnlyList<string> OwnerNames { get; init; } = Array.Empty<string>();
+
+    public bool? IsShared { get; init; }
+
+    public bool? IsStarred { get; init; }
+
     public IReadOnlyList<string> ParentIds { get; init; } = Array.Empty<string>();
 
     public string? SharedDriveId { get; init; }

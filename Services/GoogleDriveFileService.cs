@@ -9,7 +9,7 @@ public sealed class GoogleDriveFileService
     private const string FolderMimeType = "application/vnd.google-apps.folder";
     private const string GoogleWorkspaceMimeTypePrefix = "application/vnd.google-apps.";
     private const string RequestedFields =
-        "nextPageToken,files(id,name,mimeType,size,md5Checksum,modifiedTime,parents,driveId,trashed)";
+        "nextPageToken,files(id,name,mimeType,size,md5Checksum,createdTime,modifiedTime,parents,driveId,owners(displayName),shared,starred,trashed)";
     private const string MyDriveUrl = "https://drive.google.com/drive/my-drive";
 
     public async Task<DriveScanResult> GetComparableFilesAsync(
@@ -89,8 +89,16 @@ public sealed class GoogleDriveFileService
                     Size = size,
                     Md5Checksum = file.Md5Checksum,
                     ModifiedTime = file.ModifiedTimeDateTimeOffset,
+                    CreatedTime = file.CreatedTimeDateTimeOffset,
                     ParentIds = parentIds,
-                    SharedDriveId = file.DriveId
+                    SharedDriveId = file.DriveId,
+                    OwnerNames = file.Owners?
+                        .Select(owner => owner.DisplayName)
+                        .Where(name => !string.IsNullOrWhiteSpace(name))
+                        .Cast<string>()
+                        .ToArray() ?? [],
+                    IsShared = file.Shared,
+                    IsStarred = file.Starred
                 });
             }
 
