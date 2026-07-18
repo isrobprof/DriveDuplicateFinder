@@ -22,6 +22,14 @@ public sealed class DriveFileInfo
 
     public bool? IsStarred { get; init; }
 
+    public bool? OwnedByMe { get; init; }
+
+    public string? DriveId { get; init; }
+
+    public long? Version { get; init; }
+
+    public bool? CanTrash { get; init; }
+
     public IReadOnlyList<string> ParentIds { get; init; } = Array.Empty<string>();
 
     public string? SharedDriveId { get; init; }

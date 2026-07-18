@@ -13,12 +13,16 @@ public partial class Form1 : Form
     private readonly DuplicateReviewService _reviewService = new();
     private readonly KeepRecommendationService _recommendationService = new();
     private readonly ReviewStateStorageService _reviewStateStorageService = new();
+    private readonly GoogleDriveTrashService _trashService = new();
+    private readonly CleanupHistoryService _cleanupHistoryService = new();
     private readonly List<DuplicateGroupReview> _reviews = [];
     private readonly System.Windows.Forms.Timer _reviewSaveTimer = new() { Interval = 1500 };
     private readonly SemaphoreSlim _reviewSaveSemaphore = new(1, 1);
     private List<DuplicateGroupReview> _filteredReviews = [];
     private DriveService? _driveService;
+    private DriveService? _cleanupDriveService;
     private CancellationTokenSource? _searchCancellationTokenSource;
+    private CancellationTokenSource? _cleanupCancellationTokenSource;
     private DuplicateGroupReview? _selectedReview;
     private bool _isRefreshingReviewControls;
     private bool _reviewStateIsCorrupt;
@@ -29,6 +33,9 @@ public partial class Form1 : Form
     private SplitContainer? _mainSplit;
     private bool _mainSplitLayoutInitialized;
     private int _mainSplitInitializationAttempts;
+    private bool _cleanupModeActive;
+    private bool _cleanupOperationInProgress;
+    private bool _scanResultsAreObsolete;
 
     private readonly GroupBox grpFiltros = new();
     private readonly ComboBox cmbFiltroEstado = new();
@@ -51,9 +58,16 @@ public partial class Form1 : Form
     private readonly Button btnGuardarRevision = new();
     private readonly Button btnVerPlan = new();
     private readonly Button btnExportarPlan = new();
+    private readonly Button btnActivarLimpieza = new();
+    private readonly Button btnDesactivarLimpieza = new();
+    private readonly Button btnEnviarGrupoPapelera = new();
+    private readonly Button btnAbrirPapelera = new();
+    private readonly Button btnRestablecerAutorizacionLimpieza = new();
     private readonly DataGridViewComboBoxColumn colDecisionDetalle = new();
     private readonly DataGridViewLinkColumn colUbicacionDetalle = new();
     private readonly Label lblNotasRevision = new();
+    private readonly Label lblModoLimpieza = new();
+    private readonly Label lblElegibilidadLimpieza = new();
 
     public Form1()
     {
@@ -145,6 +159,8 @@ public partial class Form1 : Form
             _reviews.Clear();
             _reviews.AddRange(_reviewService.CreateReviews(duplicateGroups));
             _lastScanResult = scanResult;
+            _scanResultsAreObsolete = false;
+            btnAbrirPapelera.Enabled = false;
 
             ReviewStateLoadResult loadResult = await _reviewStateStorageService.LoadAsync(
                 _searchCancellationTokenSource.Token);
@@ -201,6 +217,7 @@ public partial class Form1 : Form
     private void btnCancelar_Click(object? sender, EventArgs e)
     {
         _searchCancellationTokenSource?.Cancel();
+        _cleanupCancellationTokenSource?.Cancel();
     }
 
     private void InitializeReviewControls()
@@ -233,8 +250,9 @@ public partial class Form1 : Form
             ColumnCount = 1,
             Dock = DockStyle.Fill,
             Padding = new Padding(12, 10, 12, 8),
-            RowCount = 5
+            RowCount = 6
         };
+        headerLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         headerLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         headerLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         headerLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -260,13 +278,21 @@ public partial class Form1 : Form
         ConfigureHeaderButton(btnConectar);
         ConfigureHeaderButton(btnBuscar);
         ConfigureHeaderButton(btnCancelar);
-        commandPanel.Controls.AddRange([btnConectar, btnBuscar, btnCancelar]);
+        ConfigureButton(btnActivarLimpieza, "Activar modo limpieza", btnActivarLimpieza_Click);
+        ConfigureButton(btnDesactivarLimpieza, "Desactivar modo limpieza", btnDesactivarLimpieza_Click);
+        ConfigureButton(btnRestablecerAutorizacionLimpieza, "Restablecer autorización de limpieza", btnRestablecerAutorizacionLimpieza_Click);
+        commandPanel.Controls.AddRange([btnConectar, btnBuscar, btnCancelar, btnActivarLimpieza, btnDesactivarLimpieza, btnRestablecerAutorizacionLimpieza]);
+
+        lblModoLimpieza.AutoSize = true;
+        lblModoLimpieza.Dock = DockStyle.Fill;
+        lblModoLimpieza.Padding = new Padding(8, 5, 8, 5);
 
         headerLayout.Controls.Add(lblTitulo, 0, 0);
         headerLayout.Controls.Add(lblDescripcion, 0, 1);
         headerLayout.Controls.Add(commandPanel, 0, 2);
         headerLayout.Controls.Add(lblEstado, 0, 3);
         headerLayout.Controls.Add(progressBar, 0, 4);
+        headerLayout.Controls.Add(lblModoLimpieza, 0, 5);
 
         var leftLayout = new TableLayoutPanel
         {
@@ -322,6 +348,7 @@ public partial class Form1 : Form
         rootLayout.Controls.Add(mainSplit, 0, 1);
         Controls.Add(rootLayout);
         ResumeLayout(true);
+        RefreshCleanupEligibility();
     }
 
     private void Form1_Shown(object? sender, EventArgs e)
@@ -493,12 +520,18 @@ public partial class Form1 : Form
         ConfigureButton(btnGuardarRevision, "Guardar revisi\u00F3n", btnGuardarRevision_Click);
         ConfigureButton(btnVerPlan, "Ver plan de limpieza", btnVerPlan_Click);
         ConfigureButton(btnExportarPlan, "Exportar plan", btnExportarPlan_Click);
+        ConfigureButton(btnEnviarGrupoPapelera, "Enviar grupo seleccionado a la papelera", btnEnviarGrupoPapelera_Click);
+        ConfigureButton(btnAbrirPapelera, "Abrir papelera de Google Drive", btnAbrirPapelera_Click);
+        lblElegibilidadLimpieza.AutoSize = true;
+        lblElegibilidadLimpieza.Dock = DockStyle.Fill;
+        lblElegibilidadLimpieza.MaximumSize = new Size(0, 54);
 
         var navigationPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true };
         navigationPanel.Controls.AddRange([btnAnteriorGrupo, btnSiguienteGrupo, btnSiguientePendiente, btnSiguienteListo]);
         var actionPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true };
-        actionPanel.Controls.AddRange([btnMarcarRevisado, btnGuardarRevision, btnVerPlan, btnExportarPlan]);
-        var reviewLayout = new TableLayoutPanel { ColumnCount = 1, Dock = DockStyle.Fill, RowCount = 7 };
+        actionPanel.Controls.AddRange([btnMarcarRevisado, btnGuardarRevision, btnVerPlan, btnExportarPlan, btnEnviarGrupoPapelera, btnAbrirPapelera]);
+        var reviewLayout = new TableLayoutPanel { ColumnCount = 1, Dock = DockStyle.Fill, RowCount = 8 };
+        reviewLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         reviewLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         reviewLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         reviewLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -513,6 +546,7 @@ public partial class Form1 : Form
         reviewLayout.Controls.Add(lblNotasRevision, 0, 4);
         reviewLayout.Controls.Add(txtNotas, 0, 5);
         reviewLayout.Controls.Add(actionPanel, 0, 6);
+        reviewLayout.Controls.Add(lblElegibilidadLimpieza, 0, 7);
         grpRevision.Controls.Add(reviewLayout);
     }
 
@@ -622,6 +656,7 @@ public partial class Form1 : Form
             dgvDuplicados.DataSource = null;
             dgvGrupoDetalle.DataSource = null;
             lblGrupoNavegacion.Text = "Sin grupos para revisar.";
+            RefreshCleanupEligibility();
             return;
         }
 
@@ -653,6 +688,7 @@ public partial class Form1 : Form
         }
 
         SelectReview(selected);
+        RefreshCleanupEligibility();
     }
 
     private IEnumerable<DuplicateGroupReview> ApplyFilters(IEnumerable<DuplicateGroupReview> source)
@@ -716,6 +752,7 @@ public partial class Form1 : Form
             lblEstadoRevision.Text = string.Empty;
             lblRecomendacion.Text = string.Empty;
             txtNotas.Text = string.Empty;
+            RefreshCleanupEligibility();
             return;
         }
 
@@ -750,6 +787,8 @@ public partial class Form1 : Form
         {
             _isRefreshingReviewControls = false;
         }
+
+        RefreshCleanupEligibility();
     }
 
     private void dgvDuplicados_SelectionChanged(object? sender, EventArgs e)
@@ -882,6 +921,7 @@ public partial class Form1 : Form
         }
 
         await SaveReviewStateAsync(forceOverwrite, showError: true);
+        RefreshCleanupEligibility();
     }
 
     private void btnVerPlan_Click(object? sender, EventArgs e)
@@ -931,6 +971,448 @@ public partial class Form1 : Form
         {
             MessageBox.Show($"No se pudo exportar el plan.{Environment.NewLine}{Environment.NewLine}{ex.Message}", "Error al exportar", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    private async void btnActivarLimpieza_Click(object? sender, EventArgs e)
+    {
+        if (_cleanupOperationInProgress || _cleanupModeActive)
+        {
+            return;
+        }
+
+        using var information = new CleanupModeActivationForm();
+        if (information.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        btnActivarLimpieza.Enabled = false;
+        lblEstado.Text = "Solicitando la autorización independiente del modo limpieza...";
+        DriveService? newCleanupDriveService = null;
+        try
+        {
+            var authService = new GoogleDriveCleanupAuthService();
+            newCleanupDriveService = await authService.ConnectAsync();
+            _cleanupDriveService?.Dispose();
+            _cleanupDriveService = newCleanupDriveService;
+            newCleanupDriveService = null;
+            _cleanupModeActive = true;
+            lblEstado.Text = "Modo limpieza activo.";
+            RefreshCleanupEligibility();
+        }
+        catch (CleanupAuthorizationScopeException)
+        {
+            lblEstado.Text = "Google no concedió el permiso completo necesario para el modo limpieza. Restablece la autorización y vuelve a intentarlo.";
+            MessageBox.Show(
+                lblEstado.Text,
+                "Modo limpieza",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+        catch (OperationCanceledException)
+        {
+            lblEstado.Text = "La autorización del modo limpieza fue cancelada. La aplicación sigue en modo de solo lectura.";
+        }
+        catch (Exception)
+        {
+            lblEstado.Text = "No se pudo activar el modo limpieza. La aplicación sigue en modo de solo lectura.";
+            MessageBox.Show(
+                "No se pudo completar la autorización independiente del modo limpieza. No se modificó Google Drive.",
+                "Modo limpieza",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            newCleanupDriveService?.Dispose();
+            RefreshCleanupEligibility();
+        }
+    }
+
+    private void btnDesactivarLimpieza_Click(object? sender, EventArgs e)
+    {
+        if (_cleanupOperationInProgress)
+        {
+            return;
+        }
+
+        DeactivateCleanupMode(showStatus: true);
+    }
+
+    private void btnRestablecerAutorizacionLimpieza_Click(object? sender, EventArgs e)
+    {
+        if (_cleanupModeActive || _cleanupOperationInProgress)
+        {
+            MessageBox.Show(
+                "Desactiva el modo limpieza antes de restablecer su autorización.",
+                "Restablecer autorización de limpieza",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (MessageBox.Show(
+                "Se eliminará únicamente la autorización local del modo limpieza. La próxima activación solicitará permiso para administrar los archivos de Google Drive. La aplicación solo utilizará ese permiso para enviar a la papelera los candidatos que confirmes. ¿Continuar?",
+                "Restablecer autorización de limpieza",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question) != DialogResult.Yes)
+        {
+            return;
+        }
+
+        try
+        {
+            new GoogleDriveCleanupAuthService().ResetStoredAuthorization();
+            lblEstado.Text = "La próxima activación solicitará permiso para administrar los archivos de Google Drive. La aplicación solo utilizará ese permiso para enviar a la papelera los candidatos que confirmes.";
+            MessageBox.Show(lblEstado.Text, "Restablecer autorización de limpieza", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception)
+        {
+            MessageBox.Show(
+                "No se pudo restablecer la autorización local del modo limpieza.",
+                "Restablecer autorización de limpieza",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+    }
+
+    private async void btnEnviarGrupoPapelera_Click(object? sender, EventArgs e)
+    {
+        DuplicateGroupReview? review = GetCurrentSelectedReview();
+        if (review is null || _cleanupDriveService is null || !_cleanupModeActive || _cleanupOperationInProgress)
+        {
+            return;
+        }
+
+        CleanupEligibilityResult eligibility = GetCleanupEligibility();
+        if (!eligibility.IsAllowed)
+        {
+            MessageBox.Show(
+                string.Join(Environment.NewLine, eligibility.BlockingReasons),
+                "Grupo bloqueado para limpieza",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            RefreshCleanupEligibility();
+            return;
+        }
+
+        _cleanupOperationInProgress = true;
+        _cleanupCancellationTokenSource = new CancellationTokenSource();
+        SetCleanupUiBusy(true);
+        CleanupHistoryHandle? history = null;
+
+        try
+        {
+            lblEstado.Text = "Creando el historial obligatorio antes de comprobar el grupo...";
+            history = await _cleanupHistoryService.CreatePendingAsync(review, _cleanupCancellationTokenSource.Token);
+
+            var preflightProgress = new Progress<string>(status => lblEstado.Text = status);
+            CleanupPreflightResult preflight = await _trashService.PreflightAsync(
+                _cleanupDriveService,
+                review,
+                _scanResultsAreObsolete,
+                preflightProgress,
+                _cleanupCancellationTokenSource.Token);
+
+            history.Record.Validations.Clear();
+            history.Record.Validations.AddRange(preflight.ValidationMessages);
+            history.Record.KeepFile = preflight.KeepFile ?? history.Record.KeepFile;
+            history.Record.CandidateFiles.Clear();
+            history.Record.CandidateFiles.AddRange(preflight.CandidateFiles);
+            if (!preflight.IsSuccessful)
+            {
+                history.Record.Status = preflight.WasCancelled
+                    ? CleanupOperationStatus.Cancelled
+                    : CleanupOperationStatus.PreflightFailed;
+                history.Record.FinishedAtUtc = DateTimeOffset.UtcNow;
+                history.Record.SanitizedErrorMessage = preflight.WasCancelled
+                    ? "El preflight fue cancelado antes de modificar Google Drive."
+                    : "El preflight bloqueó el grupo. Debes repetir el análisis o revisar las decisiones.";
+                await _cleanupHistoryService.SaveAsync(history, CancellationToken.None);
+                MessageBox.Show(
+                    string.Join(Environment.NewLine, preflight.ValidationMessages),
+                    preflight.WasCancelled ? "Preflight cancelado" : "Preflight bloqueado",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            await _cleanupHistoryService.SaveAsync(history, _cleanupCancellationTokenSource.Token);
+            using var confirmation = new CleanupConfirmationForm(preflight);
+            if (confirmation.ShowDialog(this) != DialogResult.OK)
+            {
+                history.Record.Status = CleanupOperationStatus.Cancelled;
+                history.Record.FinishedAtUtc = DateTimeOffset.UtcNow;
+                history.Record.SanitizedErrorMessage = "El usuario canceló la confirmación final antes de modificar Google Drive.";
+                await _cleanupHistoryService.SaveAsync(history, CancellationToken.None);
+                lblEstado.Text = "Operación de limpieza cancelada antes de enviar archivos a la papelera.";
+                return;
+            }
+
+            int candidateCount = preflight.CandidateFiles.Count;
+            if (MessageBox.Show(
+                    $"Se enviarán {candidateCount:N0} archivos a la papelera y se conservará 1 copia.",
+                    "Última confirmación",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning) != DialogResult.Yes)
+            {
+                history.Record.Status = CleanupOperationStatus.Cancelled;
+                history.Record.FinishedAtUtc = DateTimeOffset.UtcNow;
+                history.Record.SanitizedErrorMessage = "El usuario rechazó la última confirmación antes de modificar Google Drive.";
+                await _cleanupHistoryService.SaveAsync(history, CancellationToken.None);
+                lblEstado.Text = "Operación de limpieza cancelada antes de enviar archivos a la papelera.";
+                return;
+            }
+
+            var operationProgress = new Progress<(int Current, int Total, string Name)>(progress =>
+            {
+                lblEstado.Text = $"Archivo {progress.Current:N0} de {progress.Total:N0}: {progress.Name}";
+            });
+            CleanupOperationResult operation = await _trashService.ExecuteAsync(
+                _cleanupDriveService,
+                preflight,
+                _cleanupHistoryService,
+                history,
+                operationProgress,
+                _cleanupCancellationTokenSource.Token);
+
+            _scanResultsAreObsolete = operation.ShouldInvalidateScan;
+            btnAbrirPapelera.Enabled = operation.ShouldInvalidateScan;
+
+            ShowCleanupOutcome(operation);
+        }
+        catch (OperationCanceledException)
+        {
+            if (history is not null)
+            {
+                history.Record.Status = CleanupOperationStatus.Cancelled;
+                history.Record.FinishedAtUtc = DateTimeOffset.UtcNow;
+                history.Record.SanitizedErrorMessage = "La operación fue cancelada antes de completar el preflight.";
+                await _cleanupHistoryService.SaveAsync(history, CancellationToken.None);
+            }
+
+            lblEstado.Text = "Operación de limpieza cancelada. No se continuó con otros archivos.";
+        }
+        catch (Exception)
+        {
+            if (history is not null)
+            {
+                history.Record.Status = history.Record.ProcessedFiles > 0
+                    ? CleanupOperationStatus.Partial
+                    : CleanupOperationStatus.Failed;
+                history.Record.FinishedAtUtc = DateTimeOffset.UtcNow;
+                history.Record.SanitizedErrorMessage = "La operación falló. Revisa el historial local y, si procede, la papelera.";
+                await _cleanupHistoryService.SaveAsync(history, CancellationToken.None);
+            }
+
+            lblEstado.Text = "La operación de limpieza falló. No se continuó con otros archivos.";
+            MessageBox.Show(
+                "La operación de limpieza no pudo completarse. Consulta el historial local y repite el análisis antes de continuar.",
+                "Limpieza incompleta",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            _cleanupCancellationTokenSource?.Dispose();
+            _cleanupCancellationTokenSource = null;
+            _cleanupOperationInProgress = false;
+            SetCleanupUiBusy(false);
+            DeactivateCleanupMode(showStatus: false);
+            RefreshCleanupEligibility();
+        }
+    }
+
+    private void btnAbrirPapelera_Click(object? sender, EventArgs e)
+    {
+        OpenLocation("https://drive.google.com/drive/trash");
+    }
+
+    private void DeactivateCleanupMode(bool showStatus)
+    {
+        _cleanupDriveService?.Dispose();
+        _cleanupDriveService = null;
+        _cleanupModeActive = false;
+        if (showStatus)
+        {
+            lblEstado.Text = "Modo limpieza desactivado. La conexión de análisis sigue disponible en solo lectura.";
+        }
+
+        RefreshCleanupEligibility();
+    }
+
+    private DuplicateGroupReview? GetCurrentSelectedReview()
+    {
+        if (string.IsNullOrWhiteSpace(_selectedReview?.StableId))
+        {
+            return null;
+        }
+
+        return _reviews.FirstOrDefault(review => string.Equals(
+            review.StableId,
+            _selectedReview.StableId,
+            StringComparison.Ordinal));
+    }
+
+    private CleanupEligibilityResult GetCleanupEligibility()
+    {
+        return _trashService.EvaluateEligibility(
+            GetCurrentSelectedReview(),
+            new CleanupEligibilityContext(
+                CleanupModeActive: _cleanupModeActive && _cleanupDriveService is not null,
+                SearchCompleted: _lastScanResult is not null,
+                ResultsAreObsolete: _scanResultsAreObsolete,
+                OperationInProgress: _cleanupOperationInProgress));
+    }
+
+    private void RefreshCleanupEligibility()
+    {
+        CleanupEligibilityResult eligibility = GetCleanupEligibility();
+
+        btnActivarLimpieza.Enabled = !_cleanupOperationInProgress && !_cleanupModeActive;
+        btnDesactivarLimpieza.Enabled = !_cleanupOperationInProgress && _cleanupModeActive;
+        btnRestablecerAutorizacionLimpieza.Enabled = !_cleanupOperationInProgress && !_cleanupModeActive;
+        btnEnviarGrupoPapelera.Enabled = eligibility.IsAllowed;
+        lblModoLimpieza.Text = _cleanupModeActive
+            ? "MODO LIMPIEZA ACTIVO: solo se puede intentar un único grupo que supere todas las validaciones."
+            : "Modo limpieza desactivado: el análisis permanece en modo de solo lectura.";
+        lblModoLimpieza.BackColor = _cleanupModeActive ? Color.MistyRose : Color.Honeydew;
+        lblModoLimpieza.ForeColor = _cleanupModeActive ? Color.DarkRed : Color.DarkGreen;
+        lblElegibilidadLimpieza.Text = eligibility.IsAllowed
+            ? "El grupo seleccionado está preparado para enviarse a la papelera."
+            : $"Limpieza no disponible: {string.Join(Environment.NewLine, eligibility.BlockingReasons)}";
+        lblElegibilidadLimpieza.ForeColor = eligibility.IsAllowed ? Color.DarkGreen : Color.DarkGoldenrod;
+    }
+
+    private void SetCleanupUiBusy(bool isBusy)
+    {
+        btnConectar.Enabled = !isBusy;
+        btnBuscar.Enabled = !isBusy && _driveService is not null;
+        btnCancelar.Enabled = isBusy;
+        if (isBusy)
+        {
+            btnActivarLimpieza.Enabled = false;
+            btnDesactivarLimpieza.Enabled = false;
+            btnEnviarGrupoPapelera.Enabled = false;
+            btnAbrirPapelera.Enabled = false;
+            btnRestablecerAutorizacionLimpieza.Enabled = false;
+        }
+        cmbFiltroEstado.Enabled = !isBusy;
+        cmbTamanoMinimo.Enabled = !isBusy;
+        cmbOrden.Enabled = !isBusy;
+        txtBuscarRevision.Enabled = !isBusy;
+        chkSoloCompartidos.Enabled = !isBusy;
+        chkMasDeDosCopias.Enabled = !isBusy;
+        dgvGrupoDetalle.ReadOnly = isBusy;
+        txtNotas.ReadOnly = isBusy;
+        btnAnteriorGrupo.Enabled = !isBusy;
+        btnSiguienteGrupo.Enabled = !isBusy;
+        btnSiguientePendiente.Enabled = !isBusy;
+        btnSiguienteListo.Enabled = !isBusy;
+        btnMarcarRevisado.Enabled = !isBusy;
+        btnGuardarRevision.Enabled = !isBusy;
+        btnVerPlan.Enabled = !isBusy;
+        btnExportarPlan.Enabled = !isBusy;
+    }
+
+    private void ShowCleanupOutcome(CleanupOperationResult operation)
+    {
+        CleanupOperationRecord record = operation.Record;
+        switch (record.Status)
+        {
+            case CleanupOperationStatus.Completed:
+                lblEstado.Text = "Los archivos seleccionados se han enviado a la papelera. No se han eliminado permanentemente. Debes repetir la búsqueda antes de realizar otra limpieza.";
+                MessageBox.Show(lblEstado.Text, "Limpieza completada", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                break;
+            case CleanupOperationStatus.Partial:
+                lblEstado.Text = "La operación quedó incompleta. Revisa la papelera y repite el análisis antes de continuar.";
+                MessageBox.Show($"{lblEstado.Text}{Environment.NewLine}{Environment.NewLine}{BuildCleanupFileDetails(record)}", "Limpieza parcial", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                break;
+            case CleanupOperationStatus.Cancelled:
+                lblEstado.Text = "La operación fue cancelada. Repite el análisis antes de continuar si se inició algún envío.";
+                MessageBox.Show($"{lblEstado.Text}{Environment.NewLine}{Environment.NewLine}{BuildCleanupFileDetails(record)}", "Limpieza cancelada", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                break;
+            default:
+                lblEstado.Text = operation.NoFilesChanged
+                    ? "No se modificó ningún archivo. Puedes corregir el problema y volver a intentarlo."
+                    : "La operación de limpieza falló antes de completarse. Repite el análisis antes de continuar.";
+                MessageBox.Show($"{lblEstado.Text}{Environment.NewLine}{Environment.NewLine}{BuildCleanupFileDetails(record)}", "Limpieza fallida", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                break;
+        }
+    }
+
+    private static string BuildCleanupFileDetails(CleanupOperationRecord record)
+    {
+        string Describe(CleanupFileStatus status, string heading)
+        {
+            string[] names = record.FileResults
+                .Where(result => result.Status == status)
+                .Select(result => result.File.Name)
+                .ToArray();
+            return names.Length == 0 ? string.Empty : $"{heading}: {string.Join(", ", names)}";
+        }
+
+        List<string> lines =
+        [
+            Describe(CleanupFileStatus.Trashed, "Enviados correctamente"),
+            Describe(CleanupFileStatus.Failed, "Fallidos"),
+            Describe(CleanupFileStatus.Cancelled, "Cancelados"),
+            Describe(CleanupFileStatus.NotProcessed, "No procesados")
+        ];
+        foreach (CleanupFileResult failure in record.FileResults.Where(result => !string.IsNullOrWhiteSpace(result.FailureStage)))
+        {
+            lines.Add($"No se pudo enviar \"{failure.File.Name}\" a la papelera.");
+            lines.Add($"Fase: {failure.FailureStage}");
+            if (failure.HttpStatusCode is int statusCode)
+            {
+                lines.Add($"HTTP: {statusCode} {failure.HttpStatusDescription}");
+            }
+
+            if (failure.GoogleErrorCode is int errorCode)
+            {
+                lines.Add($"Código de error: {errorCode}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(failure.FailureReason))
+            {
+                lines.Add($"Motivo: {failure.FailureReason}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(failure.SanitizedTechnicalMessage))
+            {
+                lines.Add($"Mensaje: {failure.SanitizedTechnicalMessage}");
+            }
+        }
+
+        string? authorizationRecommendation = GetCleanupAuthorizationRecommendation(record);
+        if (!string.IsNullOrWhiteSpace(authorizationRecommendation))
+        {
+            lines.Add(authorizationRecommendation);
+        }
+
+        return string.Join(Environment.NewLine, lines.Where(line => !string.IsNullOrWhiteSpace(line)));
+    }
+
+    private static string? GetCleanupAuthorizationRecommendation(CleanupOperationRecord record)
+    {
+        string details = string.Join(" ", record.FileResults.SelectMany(result =>
+            new[]
+            {
+                result.FailureReason,
+                result.SanitizedTechnicalMessage,
+                result.Message
+            }.Concat(result.ApiErrors.Select(error => $"{error.Reason} {error.Message}"))));
+
+        if (details.Contains("appNotAuthorizedToFile", StringComparison.OrdinalIgnoreCase))
+        {
+            return "La autorización de limpieza no permite modificar este archivo. Restablece la autorización y asegúrate de conceder el permiso para administrar los archivos de Google Drive.";
+        }
+
+        return details.Contains("insufficientPermissions", StringComparison.OrdinalIgnoreCase) ||
+               details.Contains("insufficient authentication scopes", StringComparison.OrdinalIgnoreCase) ||
+               details.Contains("insufficient_scope", StringComparison.OrdinalIgnoreCase)
+            ? "La autorización de limpieza no contiene el permiso necesario. Restablece la autorización y vuelve a autorizarla con permiso para administrar los archivos de Google Drive."
+            : null;
     }
 
     private void btnAnteriorGrupo_Click(object? sender, EventArgs e) => NavigateGroups(-1, null);
@@ -992,6 +1474,7 @@ public partial class Form1 : Form
             _reviewStateIsCorrupt = false;
             _reviewChangesPending = _reviewChangeVersion != versionAtSave;
             lblEstadoRevision.Text = $"Revisi\u00F3n local guardada en {_reviewStateStorageService.StatePath}.";
+            RefreshCleanupEligibility();
         }
         catch (Exception ex)
         {
@@ -1053,6 +1536,9 @@ public partial class Form1 : Form
     {
         _searchCancellationTokenSource?.Cancel();
         _searchCancellationTokenSource?.Dispose();
+        _cleanupCancellationTokenSource?.Cancel();
+        _cleanupCancellationTokenSource?.Dispose();
+        DeactivateCleanupMode(showStatus: false);
         _driveService?.Dispose();
         _reviewSaveTimer.Stop();
         _reviewSaveTimer.Dispose();
