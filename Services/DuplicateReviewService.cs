@@ -103,6 +103,63 @@ public sealed class DuplicateReviewService
         TouchAndUpdateStatus(review);
     }
 
+    public void ReplaceDecisions(
+        DuplicateGroupReview review,
+        IReadOnlyDictionary<string, DuplicateFileDecision> decisions,
+        bool reviewedWithoutCleanup)
+    {
+        ArgumentNullException.ThrowIfNull(review);
+        ArgumentNullException.ThrowIfNull(decisions);
+
+        if (decisions.Count != review.DecisionsByFileId.Count ||
+            decisions.Keys.Any(fileId => !review.DecisionsByFileId.ContainsKey(fileId)))
+        {
+            throw new InvalidOperationException("Las decisiones no corresponden exactamente a los archivos del grupo.");
+        }
+
+        int keepCount = decisions.Values.Count(value => value == DuplicateFileDecision.Keep);
+        int candidateCount = decisions.Values.Count(value => value == DuplicateFileDecision.CandidateForTrash);
+        if (!reviewedWithoutCleanup && (keepCount != 1 || candidateCount >= review.Group.Files.Count))
+        {
+            throw new InvalidOperationException("El grupo debe conservar exactamente una copia y no puede marcar todas las copias como candidatas.");
+        }
+
+        foreach (string fileId in review.DecisionsByFileId.Keys.ToArray())
+        {
+            review.DecisionsByFileId[fileId] = decisions[fileId];
+        }
+
+        review.ReviewedWithoutCleanup = reviewedWithoutCleanup;
+        TouchAndUpdateStatus(review);
+    }
+
+    public void RestoreSnapshot(DuplicateGroupReview review, RecommendationApplicationSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(review);
+        ArgumentNullException.ThrowIfNull(snapshot);
+
+        if (!string.Equals(review.StableId, snapshot.GroupStableId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("El snapshot no pertenece al grupo de revisión.");
+        }
+
+        if (snapshot.DecisionsByFileId.Count != review.DecisionsByFileId.Count ||
+            snapshot.DecisionsByFileId.Keys.Any(fileId => !review.DecisionsByFileId.ContainsKey(fileId)))
+        {
+            throw new InvalidOperationException("El snapshot no contiene los archivos actuales del grupo.");
+        }
+
+        foreach (string fileId in review.DecisionsByFileId.Keys.ToArray())
+        {
+            review.DecisionsByFileId[fileId] = snapshot.DecisionsByFileId[fileId];
+        }
+
+        review.ReviewedWithoutCleanup = snapshot.ReviewedWithoutCleanup;
+        review.Notes = snapshot.Notes;
+        review.LastModifiedUtc = snapshot.LastModifiedUtc;
+        review.Status = snapshot.Status;
+    }
+
     public void ApplyStoredState(
         IEnumerable<DuplicateGroupReview> reviews,
         DuplicateReviewState storedState)

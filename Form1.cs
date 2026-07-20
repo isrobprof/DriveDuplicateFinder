@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.ComponentModel;
 using DriveDuplicateFinder.Models;
 using DriveDuplicateFinder.Services;
 using DriveDuplicateFinder.Utilities;
@@ -12,10 +13,15 @@ public partial class Form1 : Form
     private readonly DuplicateFinderService _duplicateFinderService = new();
     private readonly DuplicateReviewService _reviewService = new();
     private readonly KeepRecommendationService _recommendationService = new();
+    private readonly RecommendationApplicationService _recommendationApplicationService = new();
     private readonly ReviewStateStorageService _reviewStateStorageService = new();
     private readonly GoogleDriveTrashService _trashService = new();
     private readonly CleanupHistoryService _cleanupHistoryService = new();
     private readonly List<DuplicateGroupReview> _reviews = [];
+    private readonly BindingList<ReviewGroupRow> _mainGridRows = [];
+    private readonly Dictionary<string, KeepRecommendation> _recommendationsByGroupId = new(StringComparer.Ordinal);
+    private readonly RecommendationUndoSession _recommendationUndoSession = new();
+    private readonly ToolTip _recommendationToolTip = new();
     private readonly System.Windows.Forms.Timer _reviewSaveTimer = new() { Interval = 1500 };
     private readonly SemaphoreSlim _reviewSaveSemaphore = new(1, 1);
     private List<DuplicateGroupReview> _filteredReviews = [];
@@ -55,6 +61,8 @@ public partial class Form1 : Form
     private readonly Button btnSiguientePendiente = new();
     private readonly Button btnSiguienteListo = new();
     private readonly Button btnMarcarRevisado = new();
+    private readonly Button btnAplicarRecomendacion = new();
+    private readonly Button btnDeshacerRecomendacion = new();
     private readonly Button btnGuardarRevision = new();
     private readonly Button btnVerPlan = new();
     private readonly Button btnExportarPlan = new();
@@ -140,6 +148,7 @@ public partial class Form1 : Form
         btnCancelar.Enabled = true;
         dgvDuplicados.DataSource = null;
         _searchCancellationTokenSource = new CancellationTokenSource();
+        RefreshRecommendationActionAvailability();
 
         try
         {
@@ -157,6 +166,8 @@ public partial class Form1 : Form
                 _searchCancellationTokenSource.Token);
 
             _reviews.Clear();
+            _recommendationsByGroupId.Clear();
+            _recommendationUndoSession.Clear();
             _reviews.AddRange(_reviewService.CreateReviews(duplicateGroups));
             _lastScanResult = scanResult;
             _scanResultsAreObsolete = false;
@@ -517,6 +528,10 @@ public partial class Form1 : Form
         txtNotas.Leave += txtNotas_Leave;
 
         ConfigureButton(btnMarcarRevisado, "Marcar revisado sin borrar", btnMarcarRevisado_Click);
+        ConfigureButton(btnAplicarRecomendacion, "Aplicar recomendación", btnAplicarRecomendacion_Click);
+        ConfigureButton(btnDeshacerRecomendacion, "Deshacer recomendación", btnDeshacerRecomendacion_Click);
+        _recommendationToolTip.SetToolTip(btnAplicarRecomendacion, "Marca localmente el archivo recomendado como Conservar y las copias elegibles como candidatas. No modifica Google Drive.");
+        _recommendationToolTip.SetToolTip(btnDeshacerRecomendacion, "Restaura las decisiones que tenía este grupo antes de aplicar la recomendación.");
         ConfigureButton(btnGuardarRevision, "Guardar revisi\u00F3n", btnGuardarRevision_Click);
         ConfigureButton(btnVerPlan, "Ver plan de limpieza", btnVerPlan_Click);
         ConfigureButton(btnExportarPlan, "Exportar plan", btnExportarPlan_Click);
@@ -529,7 +544,7 @@ public partial class Form1 : Form
         var navigationPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true };
         navigationPanel.Controls.AddRange([btnAnteriorGrupo, btnSiguienteGrupo, btnSiguientePendiente, btnSiguienteListo]);
         var actionPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true };
-        actionPanel.Controls.AddRange([btnMarcarRevisado, btnGuardarRevision, btnVerPlan, btnExportarPlan, btnEnviarGrupoPapelera, btnAbrirPapelera]);
+        actionPanel.Controls.AddRange([btnAplicarRecomendacion, btnDeshacerRecomendacion, btnMarcarRevisado, btnGuardarRevision, btnVerPlan, btnExportarPlan, btnEnviarGrupoPapelera, btnAbrirPapelera]);
         var reviewLayout = new TableLayoutPanel { ColumnCount = 1, Dock = DockStyle.Fill, RowCount = 8 };
         reviewLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         reviewLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -667,20 +682,19 @@ public partial class Form1 : Form
         _isRefreshingReviewControls = true;
         try
         {
-            dgvDuplicados.DataSource = _filteredReviews
-                .SelectMany(review => review.Group.Files.Select(file => new ReviewGroupRow
-                {
-                    StableGroupId = review.StableId,
-                    GroupNumber = review.Group.GroupNumber,
-                    Name = file.Name,
-                    Path = file.Path,
-                    Size = FileSizeFormatter.Format(file.Size),
-                    ModifiedTime = file.ModifiedTime?.ToLocalTime().ToString("g") ?? "No disponible",
-                    Md5Checksum = file.Md5Checksum,
-                    Status = GetStatusText(review.Status),
-                    ParentFolderUrl = file.ParentFolderUrl
-                }))
-                .ToList();
+            _mainGridRows.RaiseListChangedEvents = false;
+            _mainGridRows.Clear();
+            foreach (ReviewGroupRow row in _filteredReviews.SelectMany(CreateMainRows))
+            {
+                _mainGridRows.Add(row);
+            }
+
+            _mainGridRows.RaiseListChangedEvents = true;
+            _mainGridRows.ResetBindings();
+            if (dgvDuplicados.DataSource is null)
+            {
+                dgvDuplicados.DataSource = _mainGridRows;
+            }
         }
         finally
         {
@@ -689,6 +703,59 @@ public partial class Form1 : Form
 
         SelectReview(selected);
         RefreshCleanupEligibility();
+    }
+
+    private IEnumerable<ReviewGroupRow> CreateMainRows(DuplicateGroupReview review)
+    {
+        return review.Group.Files.Select(file => new ReviewGroupRow
+        {
+            StableGroupId = review.StableId,
+            GroupNumber = review.Group.GroupNumber,
+            Name = file.Name,
+            Path = file.Path,
+            Size = FileSizeFormatter.Format(file.Size),
+            ModifiedTime = file.ModifiedTime?.ToLocalTime().ToString("g") ?? "No disponible",
+            Md5Checksum = file.Md5Checksum,
+            Status = GetStatusText(review.Status),
+            ParentFolderUrl = file.ParentFolderUrl
+        });
+    }
+
+    private void RefreshAfterRecommendationChange(DuplicateGroupReview review)
+    {
+        lblResumen.Text = BuildSummary(_lastScanResult, _reviewService.BuildSummary(_reviews));
+        bool statusChangesFilterOrOrder = cmbFiltroEstado.SelectedItem is ReviewStatusFilterOption { Status: not null } ||
+            cmbOrden.SelectedIndex == 4;
+        if (statusChangesFilterOrOrder || !_filteredReviews.Any(item => item.StableId == review.StableId))
+        {
+            RefreshReviewViews(review.StableId);
+            return;
+        }
+
+        int firstRow = _mainGridRows.ToList().FindIndex(row => row.StableGroupId == review.StableId);
+        if (firstRow < 0)
+        {
+            RefreshReviewViews(review.StableId);
+            return;
+        }
+
+        int oldRowCount = _mainGridRows.Count(row => row.StableGroupId == review.StableId);
+        IReadOnlyList<ReviewGroupRow> replacementRows = CreateMainRows(review).ToArray();
+        _mainGridRows.RaiseListChangedEvents = false;
+        for (int index = 0; index < oldRowCount; index++)
+        {
+            _mainGridRows.RemoveAt(firstRow);
+        }
+
+        for (int index = 0; index < replacementRows.Count; index++)
+        {
+            _mainGridRows.Insert(firstRow + index, replacementRows[index]);
+        }
+
+        _mainGridRows.RaiseListChangedEvents = true;
+        _mainGridRows.ResetBindings();
+        SelectReview(review);
+        SelectMainRow(review.StableId);
     }
 
     private IEnumerable<DuplicateGroupReview> ApplyFilters(IEnumerable<DuplicateGroupReview> source)
@@ -760,8 +827,13 @@ public partial class Form1 : Form
         lblGrupoNavegacion.Text = $"Grupo {currentIndex + 1} de {_filteredReviews.Count} (visual {review.Group.GroupNumber})";
         lblEstadoRevision.Text = $"Estado: {GetStatusText(review.Status)}. Espacio recuperable del grupo: {FileSizeFormatter.Format(review.Group.RecoverableBytes)}.";
 
-        KeepRecommendation recommendation = _recommendationService.GetRecommendation(review);
-        lblRecomendacion.Text = recommendation.Reason;
+        KeepRecommendation recommendation = GetOrCreateRecommendation(review);
+        ApplyRecommendationPreview? recommendationPreview = TryCreateRecommendationPreview(review, recommendation);
+        lblRecomendacion.Text = recommendationPreview is null
+            ? recommendation.Reason
+            : $"{recommendation.Reason}{Environment.NewLine}" +
+              $"{recommendationPreview.CandidateFiles.Count} copias se marcarán como candidatas. " +
+              $"{recommendationPreview.SkippedFiles.Count} archivos quedarán sin decidir por seguridad.";
 
         _isRefreshingReviewControls = true;
         try
@@ -791,6 +863,55 @@ public partial class Form1 : Form
         RefreshCleanupEligibility();
     }
 
+    private KeepRecommendation GetOrCreateRecommendation(DuplicateGroupReview review)
+    {
+        if (!_recommendationsByGroupId.TryGetValue(review.StableId, out KeepRecommendation? recommendation))
+        {
+            recommendation = _recommendationService.GetRecommendation(review);
+            _recommendationsByGroupId[review.StableId] = recommendation;
+        }
+
+        return recommendation;
+    }
+
+    private ApplyRecommendationPreview? TryCreateRecommendationPreview(
+        DuplicateGroupReview review,
+        KeepRecommendation recommendation)
+    {
+        try
+        {
+            return _recommendationApplicationService.CreatePreview(review, recommendation);
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    private bool CanApplyRecommendation(DuplicateGroupReview? review)
+    {
+        if (review is null || review.Group.Files.Count < 2 || review.ReviewedWithoutCleanup ||
+            _searchCancellationTokenSource is not null || _cleanupOperationInProgress || _scanResultsAreObsolete)
+        {
+            return false;
+        }
+
+        if (review.Status is not (DuplicateGroupReviewStatus.Pending or DuplicateGroupReviewStatus.PartiallyReviewed or DuplicateGroupReviewStatus.ReadyForCleanup))
+        {
+            return false;
+        }
+
+        return TryCreateRecommendationPreview(review, GetOrCreateRecommendation(review)) is not null;
+    }
+
+    private void RefreshRecommendationActionAvailability()
+    {
+        bool interactionAllowed = _searchCancellationTokenSource is null && !_cleanupOperationInProgress;
+        btnAplicarRecomendacion.Enabled = interactionAllowed && CanApplyRecommendation(_selectedReview);
+        btnDeshacerRecomendacion.Enabled = interactionAllowed && _selectedReview is not null &&
+            _recommendationUndoSession.HasSnapshot(_selectedReview.StableId);
+    }
+
     private void dgvDuplicados_SelectionChanged(object? sender, EventArgs e)
     {
         if (_isRefreshingReviewControls || dgvDuplicados.CurrentRow?.DataBoundItem is not ReviewGroupRow row)
@@ -817,6 +938,11 @@ public partial class Form1 : Form
         else if (!string.IsNullOrWhiteSpace(result.AutomaticallyKeptFileId))
         {
             lblEstadoRevision.Text = "Se marc\u00F3 autom\u00E1ticamente una copia como Conservar para mantener el grupo seguro.";
+        }
+
+        if (result.Accepted)
+        {
+            _recommendationUndoSession.Invalidate(_selectedReview.StableId);
         }
 
         MarkReviewChanged();
@@ -900,8 +1026,78 @@ public partial class Form1 : Form
         }
 
         _reviewService.MarkReviewedWithoutCleanup(_selectedReview);
+        _recommendationUndoSession.Invalidate(_selectedReview.StableId);
         MarkReviewChanged();
         RefreshReviewViews(_selectedReview.StableId);
+    }
+
+    private async void btnAplicarRecomendacion_Click(object? sender, EventArgs e)
+    {
+        DuplicateGroupReview? review = _selectedReview;
+        if (!CanApplyRecommendation(review) || review is null)
+        {
+            return;
+        }
+
+        KeepRecommendation recommendation = GetOrCreateRecommendation(review);
+        ApplyRecommendationPreview? preview = TryCreateRecommendationPreview(review, recommendation);
+        if (preview is null)
+        {
+            return;
+        }
+
+        using var previewForm = new ApplyRecommendationPreviewForm(preview);
+        if (previewForm.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        RecommendationApplicationResult result;
+        try
+        {
+            result = _recommendationApplicationService.ApplyConfirmedPreview(
+                review,
+                preview,
+                _reviewService,
+                isConfirmed: true);
+        }
+        catch (InvalidOperationException exception)
+        {
+            MessageBox.Show(exception.Message, "No se pudo aplicar la recomendación", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        _recommendationUndoSession.Store(result.PreviousState);
+        MarkReviewChanged();
+        RefreshAfterRecommendationChange(review);
+        await SaveReviewStateAsync(forceOverwriteCorruptState: false, showError: true);
+        lblEstado.Text = "Recomendación aplicada al grupo.";
+    }
+
+    private async void btnDeshacerRecomendacion_Click(object? sender, EventArgs e)
+    {
+        if (_selectedReview is not DuplicateGroupReview review ||
+            !_recommendationUndoSession.TryGet(review.StableId, out RecommendationApplicationSnapshot? snapshot) ||
+            snapshot is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _recommendationApplicationService.RestoreSnapshot(review, snapshot, _reviewService);
+        }
+        catch (InvalidOperationException exception)
+        {
+            MessageBox.Show(exception.Message, "No se pudo deshacer la recomendación", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        _recommendationUndoSession.Invalidate(review.StableId);
+        MarkReviewChanged();
+        RefreshAfterRecommendationChange(review);
+        await SaveReviewStateAsync(forceOverwriteCorruptState: false, showError: true);
+        lblEstado.Text = "Recomendación deshecha.";
     }
 
     private async void btnGuardarRevision_Click(object? sender, EventArgs e)
@@ -1282,6 +1478,7 @@ public partial class Form1 : Form
             ? "El grupo seleccionado está preparado para enviarse a la papelera."
             : $"Limpieza no disponible: {string.Join(Environment.NewLine, eligibility.BlockingReasons)}";
         lblElegibilidadLimpieza.ForeColor = eligibility.IsAllowed ? Color.DarkGreen : Color.DarkGoldenrod;
+        RefreshRecommendationActionAvailability();
     }
 
     private void SetCleanupUiBusy(bool isBusy)
@@ -1313,6 +1510,15 @@ public partial class Form1 : Form
         btnGuardarRevision.Enabled = !isBusy;
         btnVerPlan.Enabled = !isBusy;
         btnExportarPlan.Enabled = !isBusy;
+        if (!isBusy)
+        {
+            RefreshRecommendationActionAvailability();
+        }
+        else
+        {
+            btnAplicarRecomendacion.Enabled = false;
+            btnDeshacerRecomendacion.Enabled = false;
+        }
     }
 
     private void ShowCleanupOutcome(CleanupOperationResult operation)
