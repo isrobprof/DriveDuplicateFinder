@@ -2,6 +2,8 @@ namespace DriveDuplicateFinder.Models;
 
 public sealed class ReviewGroupRow
 {
+    public bool IsBatchSelected { get; set; }
+
     public required string StableGroupId { get; init; }
 
     public required int GroupNumber { get; init; }

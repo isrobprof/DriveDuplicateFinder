@@ -14,6 +14,7 @@ public partial class Form1 : Form
     private readonly DuplicateReviewService _reviewService = new();
     private readonly KeepRecommendationService _recommendationService = new();
     private readonly RecommendationApplicationService _recommendationApplicationService = new();
+    private readonly RecommendationBatchService _recommendationBatchService;
     private readonly ReviewStateStorageService _reviewStateStorageService = new();
     private readonly GoogleDriveTrashService _trashService = new();
     private readonly CleanupHistoryService _cleanupHistoryService = new();
@@ -21,6 +22,8 @@ public partial class Form1 : Form
     private readonly BindingList<ReviewGroupRow> _mainGridRows = [];
     private readonly Dictionary<string, KeepRecommendation> _recommendationsByGroupId = new(StringComparer.Ordinal);
     private readonly RecommendationUndoSession _recommendationUndoSession = new();
+    private readonly RecommendationBatchUndoSession _recommendationBatchUndoSession = new();
+    private readonly HashSet<string> _batchSelectedStableIds = new(StringComparer.Ordinal);
     private readonly ToolTip _recommendationToolTip = new();
     private readonly System.Windows.Forms.Timer _reviewSaveTimer = new() { Interval = 1500 };
     private readonly SemaphoreSlim _reviewSaveSemaphore = new(1, 1);
@@ -42,6 +45,7 @@ public partial class Form1 : Form
     private bool _cleanupModeActive;
     private bool _cleanupOperationInProgress;
     private bool _scanResultsAreObsolete;
+    private bool _batchOperationInProgress;
 
     private readonly GroupBox grpFiltros = new();
     private readonly ComboBox cmbFiltroEstado = new();
@@ -63,6 +67,10 @@ public partial class Form1 : Form
     private readonly Button btnMarcarRevisado = new();
     private readonly Button btnAplicarRecomendacion = new();
     private readonly Button btnDeshacerRecomendacion = new();
+    private readonly Button btnSeleccionarVisibles = new();
+    private readonly Button btnDeseleccionarTodos = new();
+    private readonly Button btnAplicarRecomendacionesSeleccionadas = new();
+    private readonly Button btnDeshacerUltimoLote = new();
     private readonly Button btnGuardarRevision = new();
     private readonly Button btnVerPlan = new();
     private readonly Button btnExportarPlan = new();
@@ -73,12 +81,15 @@ public partial class Form1 : Form
     private readonly Button btnRestablecerAutorizacionLimpieza = new();
     private readonly DataGridViewComboBoxColumn colDecisionDetalle = new();
     private readonly DataGridViewLinkColumn colUbicacionDetalle = new();
+    private readonly DataGridViewCheckBoxColumn colSeleccionLote = new();
     private readonly Label lblNotasRevision = new();
     private readonly Label lblModoLimpieza = new();
     private readonly Label lblElegibilidadLimpieza = new();
+    private readonly Label lblSeleccionLote = new();
 
     public Form1()
     {
+        _recommendationBatchService = new RecommendationBatchService(_recommendationApplicationService, _reviewService);
         InitializeComponent();
         InitializeReviewControls();
         FormClosing += Form1_FormClosing;
@@ -147,6 +158,8 @@ public partial class Form1 : Form
         btnBuscar.Enabled = false;
         btnCancelar.Enabled = true;
         dgvDuplicados.DataSource = null;
+        _recommendationBatchUndoSession.Clear();
+        _batchSelectedStableIds.Clear();
         _searchCancellationTokenSource = new CancellationTokenSource();
         RefreshRecommendationActionAvailability();
 
@@ -168,6 +181,8 @@ public partial class Form1 : Form
             _reviews.Clear();
             _recommendationsByGroupId.Clear();
             _recommendationUndoSession.Clear();
+            _recommendationBatchUndoSession.Clear();
+            _batchSelectedStableIds.Clear();
             _reviews.AddRange(_reviewService.CreateReviews(duplicateGroups));
             _lastScanResult = scanResult;
             _scanResultsAreObsolete = false;
@@ -222,6 +237,7 @@ public partial class Form1 : Form
             btnConectar.Enabled = true;
             btnBuscar.Enabled = _driveService is not null;
             btnCancelar.Enabled = false;
+            RefreshBatchSelectionUi();
         }
     }
 
@@ -241,6 +257,16 @@ public partial class Form1 : Form
         FormBorderStyle = FormBorderStyle.Sizable;
         MaximizeBox = true;
         dgvDuplicados.SelectionChanged += dgvDuplicados_SelectionChanged;
+        dgvDuplicados.CurrentCellDirtyStateChanged += dgvDuplicados_CurrentCellDirtyStateChanged;
+        dgvDuplicados.CellValueChanged += dgvDuplicados_CellValueChanged;
+        dgvDuplicados.ReadOnly = false;
+
+        colSeleccionLote.DataPropertyName = nameof(ReviewGroupRow.IsBatchSelected);
+        colSeleccionLote.HeaderText = "Lote";
+        colSeleccionLote.Name = "colSeleccionLote";
+        colSeleccionLote.ReadOnly = false;
+        colSeleccionLote.Width = 48;
+        dgvDuplicados.Columns.Insert(0, colSeleccionLote);
 
         var colEstado = new DataGridViewTextBoxColumn
         {
@@ -310,8 +336,9 @@ public partial class Form1 : Form
             ColumnCount = 1,
             Dock = DockStyle.Fill,
             Padding = new Padding(8),
-            RowCount = 3
+            RowCount = 4
         };
+        leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         leftLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         leftLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
@@ -321,9 +348,21 @@ public partial class Form1 : Form
         dgvDuplicados.Dock = DockStyle.Fill;
         dgvDuplicados.ScrollBars = ScrollBars.Both;
         ConfigureMainGridColumns(colEstado);
+        var batchSelectionPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true, Margin = new Padding(0, 0, 0, 4) };
+        ConfigureButton(btnSeleccionarVisibles, "Seleccionar visibles", btnSeleccionarVisibles_Click);
+        ConfigureButton(btnDeseleccionarTodos, "Deseleccionar todos", btnDeseleccionarTodos_Click);
+        ConfigureButton(btnAplicarRecomendacionesSeleccionadas, "Aplicar recomendaciones seleccionadas", btnAplicarRecomendacionesSeleccionadas_Click);
+        ConfigureButton(btnDeshacerUltimoLote, "Deshacer último lote", btnDeshacerUltimoLote_Click);
+        _recommendationToolTip.SetToolTip(btnSeleccionarVisibles, "Selecciona únicamente los grupos mostrados por el filtro actual.");
+        _recommendationToolTip.SetToolTip(btnAplicarRecomendacionesSeleccionadas, "Prepara decisiones locales para los grupos seleccionados. No modifica Google Drive.");
+        _recommendationToolTip.SetToolTip(btnDeshacerUltimoLote, "Restaura las decisiones anteriores al último lote aplicado durante esta sesión.");
+        lblSeleccionLote.AutoSize = true;
+        lblSeleccionLote.Padding = new Padding(4, 6, 0, 0);
+        batchSelectionPanel.Controls.AddRange([btnSeleccionarVisibles, btnDeseleccionarTodos, btnAplicarRecomendacionesSeleccionadas, btnDeshacerUltimoLote, lblSeleccionLote]);
         leftLayout.Controls.Add(lblResumen, 0, 0);
         leftLayout.Controls.Add(grpFiltros, 0, 1);
-        leftLayout.Controls.Add(dgvDuplicados, 0, 2);
+        leftLayout.Controls.Add(batchSelectionPanel, 0, 2);
+        leftLayout.Controls.Add(dgvDuplicados, 0, 3);
 
         var rightLayout = new TableLayoutPanel
         {
@@ -667,11 +706,13 @@ public partial class Form1 : Form
         if (_reviews.Count == 0)
         {
             _filteredReviews = [];
+            _batchSelectedStableIds.Clear();
             _selectedReview = null;
             dgvDuplicados.DataSource = null;
             dgvGrupoDetalle.DataSource = null;
             lblGrupoNavegacion.Text = "Sin grupos para revisar.";
             RefreshCleanupEligibility();
+            RefreshBatchSelectionUi();
             return;
         }
 
@@ -703,12 +744,14 @@ public partial class Form1 : Form
 
         SelectReview(selected);
         RefreshCleanupEligibility();
+        RefreshBatchSelectionUi();
     }
 
     private IEnumerable<ReviewGroupRow> CreateMainRows(DuplicateGroupReview review)
     {
         return review.Group.Files.Select(file => new ReviewGroupRow
         {
+            IsBatchSelected = _batchSelectedStableIds.Contains(review.StableId),
             StableGroupId = review.StableId,
             GroupNumber = review.Group.GroupNumber,
             Name = file.Name,
@@ -719,6 +762,63 @@ public partial class Form1 : Form
             Status = GetStatusText(review.Status),
             ParentFolderUrl = file.ParentFolderUrl
         });
+    }
+
+    private void dgvDuplicados_CurrentCellDirtyStateChanged(object? sender, EventArgs e)
+    {
+        if (dgvDuplicados.IsCurrentCellDirty && dgvDuplicados.CurrentCell?.OwningColumn == colSeleccionLote)
+        {
+            dgvDuplicados.CommitEdit(DataGridViewDataErrorContexts.Commit);
+        }
+    }
+
+    private void dgvDuplicados_CellValueChanged(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (_isRefreshingReviewControls || e.RowIndex < 0 || e.ColumnIndex != colSeleccionLote.Index ||
+            dgvDuplicados.Rows[e.RowIndex].DataBoundItem is not ReviewGroupRow row)
+        {
+            return;
+        }
+
+        if (row.IsBatchSelected)
+        {
+            _batchSelectedStableIds.Add(row.StableGroupId);
+        }
+        else
+        {
+            _batchSelectedStableIds.Remove(row.StableGroupId);
+        }
+
+        RefreshReviewViews(row.StableGroupId);
+    }
+
+    private void btnSeleccionarVisibles_Click(object? sender, EventArgs e)
+    {
+        foreach (DuplicateGroupReview review in _filteredReviews)
+        {
+            _batchSelectedStableIds.Add(review.StableId);
+        }
+
+        RefreshReviewViews(_selectedReview?.StableId);
+    }
+
+    private void btnDeseleccionarTodos_Click(object? sender, EventArgs e)
+    {
+        _batchSelectedStableIds.Clear();
+        RefreshReviewViews(_selectedReview?.StableId);
+    }
+
+    private void RefreshBatchSelectionUi()
+    {
+        int visibleSelected = _filteredReviews.Count(review => _batchSelectedStableIds.Contains(review.StableId));
+        lblSeleccionLote.Text = $"Seleccionados: {_batchSelectedStableIds.Count} (visibles: {visibleSelected})";
+        bool interactionAllowed = _batchSelectedStableIds.Count > 0 && _searchCancellationTokenSource is null &&
+            !_cleanupOperationInProgress && !_batchOperationInProgress && !_scanResultsAreObsolete && !_closeAfterSave && !_reviewStateIsCorrupt;
+        btnSeleccionarVisibles.Enabled = _searchCancellationTokenSource is null && !_cleanupOperationInProgress && !_batchOperationInProgress && !_scanResultsAreObsolete;
+        btnDeseleccionarTodos.Enabled = _batchSelectedStableIds.Count > 0 && !_batchOperationInProgress;
+        btnAplicarRecomendacionesSeleccionadas.Enabled = interactionAllowed;
+        btnDeshacerUltimoLote.Enabled = _recommendationBatchUndoSession.HasSnapshot && _searchCancellationTokenSource is null &&
+            !_cleanupOperationInProgress && !_batchOperationInProgress && !_scanResultsAreObsolete;
     }
 
     private void RefreshAfterRecommendationChange(DuplicateGroupReview review)
@@ -891,7 +991,7 @@ public partial class Form1 : Form
     private bool CanApplyRecommendation(DuplicateGroupReview? review)
     {
         if (review is null || review.Group.Files.Count < 2 || review.ReviewedWithoutCleanup ||
-            _searchCancellationTokenSource is not null || _cleanupOperationInProgress || _scanResultsAreObsolete)
+            _searchCancellationTokenSource is not null || _cleanupOperationInProgress || _batchOperationInProgress || _scanResultsAreObsolete)
         {
             return false;
         }
@@ -906,7 +1006,7 @@ public partial class Form1 : Form
 
     private void RefreshRecommendationActionAvailability()
     {
-        bool interactionAllowed = _searchCancellationTokenSource is null && !_cleanupOperationInProgress;
+        bool interactionAllowed = _searchCancellationTokenSource is null && !_cleanupOperationInProgress && !_batchOperationInProgress;
         btnAplicarRecomendacion.Enabled = interactionAllowed && CanApplyRecommendation(_selectedReview);
         btnDeshacerRecomendacion.Enabled = interactionAllowed && _selectedReview is not null &&
             _recommendationUndoSession.HasSnapshot(_selectedReview.StableId);
@@ -943,6 +1043,7 @@ public partial class Form1 : Form
         if (result.Accepted)
         {
             _recommendationUndoSession.Invalidate(_selectedReview.StableId);
+            InvalidateBatchUndoIfAffected(_selectedReview.StableId);
         }
 
         MarkReviewChanged();
@@ -1005,6 +1106,7 @@ public partial class Form1 : Form
         }
 
         _reviewService.UpdateNotes(_selectedReview, txtNotas.Text);
+        InvalidateBatchUndoIfAffected(_selectedReview.StableId);
         MarkReviewChanged();
         RefreshReviewViews(_selectedReview.StableId);
     }
@@ -1027,6 +1129,7 @@ public partial class Form1 : Form
 
         _reviewService.MarkReviewedWithoutCleanup(_selectedReview);
         _recommendationUndoSession.Invalidate(_selectedReview.StableId);
+        InvalidateBatchUndoIfAffected(_selectedReview.StableId);
         MarkReviewChanged();
         RefreshReviewViews(_selectedReview.StableId);
     }
@@ -1068,6 +1171,7 @@ public partial class Form1 : Form
         }
 
         _recommendationUndoSession.Store(result.PreviousState);
+        InvalidateBatchUndoIfAffected(review.StableId);
         MarkReviewChanged();
         RefreshAfterRecommendationChange(review);
         await SaveReviewStateAsync(forceOverwriteCorruptState: false, showError: true);
@@ -1098,6 +1202,154 @@ public partial class Form1 : Form
         RefreshAfterRecommendationChange(review);
         await SaveReviewStateAsync(forceOverwriteCorruptState: false, showError: true);
         lblEstado.Text = "Recomendación deshecha.";
+    }
+
+    private async void btnAplicarRecomendacionesSeleccionadas_Click(object? sender, EventArgs e)
+    {
+        if (_batchSelectedStableIds.Count == 0 || _batchOperationInProgress)
+        {
+            return;
+        }
+
+        if (_batchSelectedStableIds.Count > RecommendationBatchService.MaxRecommendationBatchGroups)
+        {
+            MessageBox.Show(
+                $"Has seleccionado {_batchSelectedStableIds.Count} grupos. El máximo permitido por lote es {RecommendationBatchService.MaxRecommendationBatchGroups}. Reduce la selección antes de continuar.",
+                "Límite del lote",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        IReadOnlyDictionary<string, DuplicateGroupReview> reviewsByStableId = GetReviewsByStableId();
+        foreach (string stableId in _batchSelectedStableIds.Where(reviewsByStableId.ContainsKey))
+        {
+            GetOrCreateRecommendation(reviewsByStableId[stableId]);
+        }
+
+        RecommendationBatchPreview preview = _recommendationBatchService.CreatePreview(
+            _batchSelectedStableIds,
+            reviewsByStableId,
+            _recommendationsByGroupId,
+            _scanResultsAreObsolete);
+        using var previewForm = new RecommendationBatchPreviewForm(preview);
+        if (previewForm.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        SetBatchUiBusy(true);
+        lblEstado.Text = $"Aplicando recomendaciones: 0 de {preview.ApplicableGroupCount}.";
+        RecommendationBatchApplyResult result;
+        try
+        {
+            result = _recommendationBatchService.ApplyConfirmedPreview(
+                preview,
+                GetReviewsByStableId(),
+                _recommendationsByGroupId,
+                _scanResultsAreObsolete,
+                isConfirmed: true,
+                progress: (current, total) => lblEstado.Text = $"Aplicando recomendaciones: {current} de {total}.");
+            foreach (RecommendationBatchGroupPreview group in preview.ApplicableGroups)
+            {
+                _recommendationUndoSession.Invalidate(group.GroupStableId);
+            }
+
+            MarkReviewChanged();
+            if (!await SaveReviewStateAsync(forceOverwriteCorruptState: false, showError: true))
+            {
+                _recommendationBatchService.RestoreSnapshots(result.UndoSnapshot.Groups, GetReviewsByStableId());
+                MarkReviewChanged();
+                await SaveReviewStateAsync(forceOverwriteCorruptState: false, showError: true);
+                MessageBox.Show("No se pudo aplicar el lote. Las decisiones locales anteriores se han restaurado.", "Lote no aplicado", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            _recommendationBatchUndoSession.Store(result.UndoSnapshot);
+            _batchSelectedStableIds.ExceptWith(preview.ApplicableGroups.Select(group => group.GroupStableId));
+            RefreshReviewViews(_selectedReview?.StableId);
+            lblEstado.Text = $"Recomendaciones aplicadas a {preview.ApplicableGroupCount} grupos. {preview.ExcludedGroupCount} grupos fueron excluidos.";
+        }
+        catch (InvalidOperationException exception)
+        {
+            MessageBox.Show(exception.Message, "No se pudo aplicar el lote", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show($"No se pudo aplicar el lote. Las decisiones locales anteriores se han restaurado.{Environment.NewLine}{Environment.NewLine}{exception.Message}", "Lote no aplicado", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBatchUiBusy(false);
+        }
+    }
+
+    private async void btnDeshacerUltimoLote_Click(object? sender, EventArgs e)
+    {
+        if (_batchOperationInProgress || !_recommendationBatchUndoSession.TryGet(out RecommendationBatchUndoSnapshot? snapshot) || snapshot is null)
+        {
+            return;
+        }
+
+        SetBatchUiBusy(true);
+        RecommendationApplicationSnapshot[] afterBatchStates = snapshot.Groups
+            .Where(group => GetReviewsByStableId().TryGetValue(group.GroupStableId, out _))
+            .Select(group => _recommendationApplicationService.CaptureSnapshot(GetReviewsByStableId()[group.GroupStableId]))
+            .ToArray();
+        try
+        {
+            _recommendationBatchService.RestoreSnapshots(snapshot.Groups, GetReviewsByStableId());
+            MarkReviewChanged();
+            if (!await SaveReviewStateAsync(forceOverwriteCorruptState: false, showError: true))
+            {
+                _recommendationBatchService.RestoreSnapshots(afterBatchStates, GetReviewsByStableId());
+                MarkReviewChanged();
+                await SaveReviewStateAsync(forceOverwriteCorruptState: false, showError: true);
+                MessageBox.Show("No se pudo deshacer el lote. Se restauró el estado local posterior al lote.", "Deshacer no completado", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            _recommendationBatchUndoSession.Clear();
+            RefreshReviewViews(_selectedReview?.StableId);
+            lblEstado.Text = "Último lote deshecho.";
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show($"No se pudo deshacer el último lote.{Environment.NewLine}{Environment.NewLine}{exception.Message}", "Deshacer no completado", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBatchUiBusy(false);
+        }
+    }
+
+    private IReadOnlyDictionary<string, DuplicateGroupReview> GetReviewsByStableId() =>
+        _reviews.ToDictionary(review => review.StableId, StringComparer.Ordinal);
+
+    private void InvalidateBatchUndoIfAffected(string? stableId)
+    {
+        if (_recommendationBatchUndoSession.InvalidateIfIncludes(stableId))
+        {
+            lblEstado.Text = "El último lote ya no puede deshacerse porque uno o varios grupos fueron modificados posteriormente.";
+        }
+    }
+
+    private void SetBatchUiBusy(bool isBusy)
+    {
+        _batchOperationInProgress = isBusy;
+        dgvDuplicados.ReadOnly = isBusy;
+        dgvGrupoDetalle.ReadOnly = isBusy || _cleanupOperationInProgress;
+        txtNotas.ReadOnly = isBusy || _cleanupOperationInProgress;
+        btnAnteriorGrupo.Enabled = !isBusy;
+        btnSiguienteGrupo.Enabled = !isBusy;
+        btnSiguientePendiente.Enabled = !isBusy;
+        btnSiguienteListo.Enabled = !isBusy;
+        btnMarcarRevisado.Enabled = !isBusy;
+        btnGuardarRevision.Enabled = !isBusy;
+        btnVerPlan.Enabled = !isBusy;
+        btnExportarPlan.Enabled = !isBusy;
+        RefreshRecommendationActionAvailability();
+        RefreshBatchSelectionUi();
     }
 
     private async void btnGuardarRevision_Click(object? sender, EventArgs e)
@@ -1292,6 +1544,7 @@ public partial class Form1 : Form
             return;
         }
 
+        InvalidateBatchUndoIfAffected(review.StableId);
         _cleanupOperationInProgress = true;
         _cleanupCancellationTokenSource = new CancellationTokenSource();
         SetCleanupUiBusy(true);
@@ -1479,6 +1732,7 @@ public partial class Form1 : Form
             : $"Limpieza no disponible: {string.Join(Environment.NewLine, eligibility.BlockingReasons)}";
         lblElegibilidadLimpieza.ForeColor = eligibility.IsAllowed ? Color.DarkGreen : Color.DarkGoldenrod;
         RefreshRecommendationActionAvailability();
+        RefreshBatchSelectionUi();
     }
 
     private void SetCleanupUiBusy(bool isBusy)
@@ -1510,6 +1764,10 @@ public partial class Form1 : Form
         btnGuardarRevision.Enabled = !isBusy;
         btnVerPlan.Enabled = !isBusy;
         btnExportarPlan.Enabled = !isBusy;
+        btnSeleccionarVisibles.Enabled = !isBusy;
+        btnDeseleccionarTodos.Enabled = !isBusy && _batchSelectedStableIds.Count > 0;
+        btnAplicarRecomendacionesSeleccionadas.Enabled = !isBusy && _batchSelectedStableIds.Count > 0;
+        btnDeshacerUltimoLote.Enabled = !isBusy && _recommendationBatchUndoSession.HasSnapshot;
         if (!isBusy)
         {
             RefreshRecommendationActionAvailability();
@@ -1662,15 +1920,16 @@ public partial class Form1 : Form
         }
     }
 
-    private async Task SaveReviewStateAsync(bool forceOverwriteCorruptState, bool showError)
+    private async Task<bool> SaveReviewStateAsync(bool forceOverwriteCorruptState, bool showError)
     {
         if (_reviews.Count == 0 || (_reviewStateIsCorrupt && !forceOverwriteCorruptState))
         {
-            return;
+            return false;
         }
 
         await _reviewSaveSemaphore.WaitAsync();
         int versionAtSave = _reviewChangeVersion;
+        bool saved = false;
         try
         {
             await _reviewStateStorageService.SaveAsync(
@@ -1681,6 +1940,7 @@ public partial class Form1 : Form
             _reviewChangesPending = _reviewChangeVersion != versionAtSave;
             lblEstadoRevision.Text = $"Revisi\u00F3n local guardada en {_reviewStateStorageService.StatePath}.";
             RefreshCleanupEligibility();
+            saved = true;
         }
         catch (Exception ex)
         {
@@ -1701,6 +1961,8 @@ public partial class Form1 : Form
                 _reviewSaveTimer.Start();
             }
         }
+
+        return saved;
     }
 
     private void MarkReviewChanged()
