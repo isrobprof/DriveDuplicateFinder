@@ -17,6 +17,7 @@ public partial class Form1 : Form
     private readonly RecommendationBatchService _recommendationBatchService;
     private readonly ReviewStateStorageService _reviewStateStorageService = new();
     private readonly GoogleDriveTrashService _trashService = new();
+    private readonly CleanupBatchService _cleanupBatchService;
     private readonly CleanupHistoryService _cleanupHistoryService = new();
     private readonly List<DuplicateGroupReview> _reviews = [];
     private readonly BindingList<ReviewGroupRow> _mainGridRows = [];
@@ -71,6 +72,7 @@ public partial class Form1 : Form
     private readonly Button btnDeseleccionarTodos = new();
     private readonly Button btnAplicarRecomendacionesSeleccionadas = new();
     private readonly Button btnDeshacerUltimoLote = new();
+    private readonly Button btnEnviarGruposPapelera = new();
     private readonly Button btnGuardarRevision = new();
     private readonly Button btnVerPlan = new();
     private readonly Button btnExportarPlan = new();
@@ -90,6 +92,7 @@ public partial class Form1 : Form
     public Form1()
     {
         _recommendationBatchService = new RecommendationBatchService(_recommendationApplicationService, _reviewService);
+        _cleanupBatchService = new CleanupBatchService(_trashService);
         InitializeComponent();
         InitializeReviewControls();
         FormClosing += Form1_FormClosing;
@@ -260,6 +263,7 @@ public partial class Form1 : Form
         dgvDuplicados.CurrentCellDirtyStateChanged += dgvDuplicados_CurrentCellDirtyStateChanged;
         dgvDuplicados.CellValueChanged += dgvDuplicados_CellValueChanged;
         dgvDuplicados.ReadOnly = false;
+        dgvDuplicados.EditMode = DataGridViewEditMode.EditOnEnter;
 
         colSeleccionLote.DataPropertyName = nameof(ReviewGroupRow.IsBatchSelected);
         colSeleccionLote.HeaderText = "Lote";
@@ -348,17 +352,35 @@ public partial class Form1 : Form
         dgvDuplicados.Dock = DockStyle.Fill;
         dgvDuplicados.ScrollBars = ScrollBars.Both;
         ConfigureMainGridColumns(colEstado);
-        var batchSelectionPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true, Margin = new Padding(0, 0, 0, 4) };
+        var batchSelectionPanel = new TableLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1,
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0, 0, 0, 4),
+            RowCount = 2
+        };
+        batchSelectionPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        batchSelectionPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        var batchPreparationRow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Fill, WrapContents = true };
+        var batchCleanupRow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Fill, WrapContents = true, Padding = new Padding(0, 3, 0, 0) };
         ConfigureButton(btnSeleccionarVisibles, "Seleccionar visibles", btnSeleccionarVisibles_Click);
         ConfigureButton(btnDeseleccionarTodos, "Deseleccionar todos", btnDeseleccionarTodos_Click);
         ConfigureButton(btnAplicarRecomendacionesSeleccionadas, "Aplicar recomendaciones seleccionadas", btnAplicarRecomendacionesSeleccionadas_Click);
         ConfigureButton(btnDeshacerUltimoLote, "Deshacer último lote", btnDeshacerUltimoLote_Click);
+        ConfigureButton(btnEnviarGruposPapelera, "Enviar grupos seleccionados a la papelera", btnEnviarGruposPapelera_Click);
+        btnEnviarGruposPapelera.MinimumSize = new Size(300, 0);
         _recommendationToolTip.SetToolTip(btnSeleccionarVisibles, "Selecciona únicamente los grupos mostrados por el filtro actual.");
         _recommendationToolTip.SetToolTip(btnAplicarRecomendacionesSeleccionadas, "Prepara decisiones locales para los grupos seleccionados. No modifica Google Drive.");
         _recommendationToolTip.SetToolTip(btnDeshacerUltimoLote, "Restaura las decisiones anteriores al último lote aplicado durante esta sesión.");
+        _recommendationToolTip.SetToolTip(btnEnviarGruposPapelera, "Envía a la papelera los candidatos de todos los grupos marcados en la columna Lote.");
         lblSeleccionLote.AutoSize = true;
         lblSeleccionLote.Padding = new Padding(4, 6, 0, 0);
-        batchSelectionPanel.Controls.AddRange([btnSeleccionarVisibles, btnDeseleccionarTodos, btnAplicarRecomendacionesSeleccionadas, btnDeshacerUltimoLote, lblSeleccionLote]);
+        batchPreparationRow.Controls.AddRange([btnSeleccionarVisibles, btnDeseleccionarTodos, btnAplicarRecomendacionesSeleccionadas, btnDeshacerUltimoLote]);
+        batchCleanupRow.Controls.AddRange([new Label { AutoSize = true, Text = "Limpieza real por lotes:", Padding = new Padding(0, 6, 0, 0), ForeColor = Color.DarkRed }, btnEnviarGruposPapelera, lblSeleccionLote]);
+        batchSelectionPanel.Controls.Add(batchPreparationRow, 0, 0);
+        batchSelectionPanel.Controls.Add(batchCleanupRow, 0, 1);
         leftLayout.Controls.Add(lblResumen, 0, 0);
         leftLayout.Controls.Add(grpFiltros, 0, 1);
         leftLayout.Controls.Add(batchSelectionPanel, 0, 2);
@@ -574,7 +596,8 @@ public partial class Form1 : Form
         ConfigureButton(btnGuardarRevision, "Guardar revisi\u00F3n", btnGuardarRevision_Click);
         ConfigureButton(btnVerPlan, "Ver plan de limpieza", btnVerPlan_Click);
         ConfigureButton(btnExportarPlan, "Exportar plan", btnExportarPlan_Click);
-        ConfigureButton(btnEnviarGrupoPapelera, "Enviar grupo seleccionado a la papelera", btnEnviarGrupoPapelera_Click);
+        ConfigureButton(btnEnviarGrupoPapelera, "Enviar este grupo a la papelera", btnEnviarGrupoPapelera_Click);
+        _recommendationToolTip.SetToolTip(btnEnviarGrupoPapelera, "Envía a la papelera únicamente los candidatos del grupo que se muestra en el panel derecho.");
         ConfigureButton(btnAbrirPapelera, "Abrir papelera de Google Drive", btnAbrirPapelera_Click);
         lblElegibilidadLimpieza.AutoSize = true;
         lblElegibilidadLimpieza.Dock = DockStyle.Fill;
@@ -812,13 +835,42 @@ public partial class Form1 : Form
     {
         int visibleSelected = _filteredReviews.Count(review => _batchSelectedStableIds.Contains(review.StableId));
         lblSeleccionLote.Text = $"Seleccionados: {_batchSelectedStableIds.Count} (visibles: {visibleSelected})";
+        bool canChangeSelection = _filteredReviews.Count > 0 && _searchCancellationTokenSource is null &&
+            !_cleanupOperationInProgress && !_batchOperationInProgress && !_closeAfterSave;
         bool interactionAllowed = _batchSelectedStableIds.Count > 0 && _searchCancellationTokenSource is null &&
             !_cleanupOperationInProgress && !_batchOperationInProgress && !_scanResultsAreObsolete && !_closeAfterSave && !_reviewStateIsCorrupt;
-        btnSeleccionarVisibles.Enabled = _searchCancellationTokenSource is null && !_cleanupOperationInProgress && !_batchOperationInProgress && !_scanResultsAreObsolete;
-        btnDeseleccionarTodos.Enabled = _batchSelectedStableIds.Count > 0 && !_batchOperationInProgress;
+        btnSeleccionarVisibles.Enabled = canChangeSelection;
+        btnDeseleccionarTodos.Enabled = _batchSelectedStableIds.Count > 0 && canChangeSelection;
         btnAplicarRecomendacionesSeleccionadas.Enabled = interactionAllowed;
+        btnEnviarGruposPapelera.Enabled = interactionAllowed && _cleanupModeActive && _cleanupDriveService is not null;
+        _recommendationToolTip.SetToolTip(btnEnviarGruposPapelera, GetBatchCleanupToolTip());
         btnDeshacerUltimoLote.Enabled = _recommendationBatchUndoSession.HasSnapshot && _searchCancellationTokenSource is null &&
             !_cleanupOperationInProgress && !_batchOperationInProgress && !_scanResultsAreObsolete;
+    }
+
+    private string GetBatchCleanupToolTip()
+    {
+        if (_batchSelectedStableIds.Count == 0)
+        {
+            return "Selecciona uno o varios grupos en la columna Lote.";
+        }
+
+        if (_scanResultsAreObsolete)
+        {
+            return "Los resultados están obsoletos. Repite la búsqueda.";
+        }
+
+        if (!_cleanupModeActive || _cleanupDriveService is null)
+        {
+            return "Activa el modo limpieza para modificar Google Drive.";
+        }
+
+        if (_cleanupOperationInProgress || _batchOperationInProgress)
+        {
+            return "Hay una operación de limpieza en curso.";
+        }
+
+        return "Envía a la papelera los candidatos de todos los grupos marcados en la columna Lote.";
     }
 
     private void RefreshAfterRecommendationChange(DuplicateGroupReview review)
@@ -1323,6 +1375,193 @@ public partial class Form1 : Form
         }
     }
 
+    private async void btnEnviarGruposPapelera_Click(object? sender, EventArgs e)
+    {
+        string[] selectedStableIds = _batchSelectedStableIds.ToArray();
+        if (selectedStableIds.Length == 0)
+        {
+            MessageBox.Show(
+                "Primero selecciona uno o varios grupos en la columna Lote.",
+                "No hay grupos seleccionados",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        if (_cleanupOperationInProgress || _batchOperationInProgress)
+        {
+            return;
+        }
+
+        if (!_cleanupModeActive || _cleanupDriveService is null)
+        {
+            MessageBox.Show(
+                "Activa el modo limpieza y completa su autorización independiente antes de preparar un lote que modifica Google Drive.",
+                "Modo limpieza no activo",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        _cleanupOperationInProgress = true;
+        _cleanupCancellationTokenSource = new CancellationTokenSource();
+        SetCleanupUiBusy(true);
+        CleanupBatchHistoryHandle? history = null;
+
+        try
+        {
+            lblEstado.Text = $"Grupos seleccionados para el lote: {selectedStableIds.Length:N0}. Ejecutando el preflight global...";
+            var preflightProgress = new Progress<string>(status => lblEstado.Text = status);
+            CleanupBatchPreview preview = await _cleanupBatchService.CreatePreviewAsync(
+                selectedStableIds,
+                GetReviewsByStableId(),
+                _cleanupDriveService,
+                _scanResultsAreObsolete,
+                preflightProgress,
+                _cleanupCancellationTokenSource.Token);
+
+            if (preview.LimitsExceeded)
+            {
+                MessageBox.Show(preview.LimitMessage, "Límite del lote", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            lblEstado.Text = "Creando el historial obligatorio antes de solicitar confirmación...";
+            history = await _cleanupHistoryService.CreateBatchPendingAsync(preview, _cleanupCancellationTokenSource.Token);
+            using var previewForm = new CleanupBatchPreviewForm(preview);
+            if (previewForm.ShowDialog(this) != DialogResult.OK)
+            {
+                history.Record.Status = CleanupBatchStatus.CancelledBeforeChanges;
+                history.Record.FinishedAtUtc = DateTimeOffset.UtcNow;
+                await _cleanupHistoryService.SaveAsync(history, CancellationToken.None);
+                lblEstado.Text = "La limpieza por lotes se canceló antes de modificar Google Drive.";
+                return;
+            }
+
+            if (MessageBox.Show(
+                    $"Se enviarán a la papelera {preview.CandidateFileCount:N0} archivos de {preview.ApplicableGroupCount:N0} grupos, con un tamaño total de {FileSizeFormatter.Format(preview.CandidateBytes)}.{Environment.NewLine}{Environment.NewLine}" +
+                    "Los archivos no se eliminarán permanentemente. ¿Deseas continuar?",
+                    "Última confirmación",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning) != DialogResult.Yes)
+            {
+                history.Record.Status = CleanupBatchStatus.CancelledBeforeChanges;
+                history.Record.FinishedAtUtc = DateTimeOffset.UtcNow;
+                await _cleanupHistoryService.SaveAsync(history, CancellationToken.None);
+                lblEstado.Text = "La limpieza por lotes se canceló antes de modificar Google Drive.";
+                return;
+            }
+
+            lblEstado.Text = "Revalidando el lote antes de enviar archivos a la papelera...";
+            using var progressForm = new CleanupBatchProgressForm();
+            var progress = new Progress<CleanupBatchProgress>(item =>
+            {
+                progressForm.Report(item);
+                lblEstado.Text = item.Status;
+            });
+            progressForm.Show(this);
+            await Task.Yield();
+
+            // A partir de este punto, el botón de la ventana de progreso solicita parar entre archivos.
+            btnCancelar.Enabled = false;
+            CleanupBatchResult result = await _cleanupBatchService.ExecuteAsync(
+                preview,
+                GetReviewsByStableId(),
+                _cleanupDriveService,
+                _scanResultsAreObsolete,
+                _cleanupHistoryService,
+                history,
+                () => progressForm.StopRequested,
+                progress,
+                _cleanupCancellationTokenSource.Token);
+            progressForm.Complete(result.Status is CleanupBatchStatus.Completed or CleanupBatchStatus.CompletedWithExclusions
+                ? "Proceso completado"
+                : result.Status is CleanupBatchStatus.CancelledBeforeChanges or CleanupBatchStatus.CancelledAfterChanges
+                    ? "Proceso detenido"
+                    : "Proceso detenido por error");
+            progressForm.Hide();
+
+            if (result.DriveChanged)
+            {
+                InvalidateResultsAfterDriveChange();
+            }
+
+            ShowCleanupBatchOutcome(result, history.Path);
+        }
+        catch (OperationCanceledException)
+        {
+            lblEstado.Text = "La limpieza por lotes se canceló antes de modificar Google Drive.";
+        }
+        catch (Exception exception)
+        {
+            lblEstado.Text = "La limpieza por lotes se detuvo por un error. No se continuará con otros grupos.";
+            MessageBox.Show(
+                $"No se pudo completar la preparación del lote.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                "Limpieza por lotes",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            _cleanupCancellationTokenSource?.Dispose();
+            _cleanupCancellationTokenSource = null;
+            _cleanupOperationInProgress = false;
+            SetCleanupUiBusy(false);
+            DeactivateCleanupMode(showStatus: false);
+            RefreshCleanupEligibility();
+        }
+    }
+
+    private void InvalidateResultsAfterDriveChange()
+    {
+        _scanResultsAreObsolete = true;
+        btnAbrirPapelera.Enabled = true;
+        _batchSelectedStableIds.Clear();
+        _recommendationUndoSession.Clear();
+        _recommendationBatchUndoSession.Clear();
+        _selectedReview = null;
+        _filteredReviews = [];
+        _mainGridRows.Clear();
+        dgvGrupoDetalle.DataSource = null;
+        txtNotas.Text = string.Empty;
+        lblGrupoNavegacion.Text = "Google Drive ha cambiado. Los resultados anteriores ya no son válidos.";
+        lblEstadoRevision.Text = "Pulsa Buscar duplicados para actualizar la información.";
+        lblRecomendacion.Text = string.Empty;
+        RefreshRecommendationActionAvailability();
+        RefreshBatchSelectionUi();
+    }
+
+    private void ShowCleanupBatchOutcome(CleanupBatchResult result, string historyPath)
+    {
+        bool mustRescan = result.DriveChanged;
+        string message = $"Estado: {DescribeBatchStatus(result.Status)}.{Environment.NewLine}{Environment.NewLine}" +
+                         $"Grupos completados: {result.CompletedGroupCount:N0}{Environment.NewLine}" +
+                         $"Grupos parcialmente procesados: {result.PartiallyProcessedGroupCount:N0}{Environment.NewLine}" +
+                         $"Grupos no procesados: {result.UnprocessedGroupCount:N0}{Environment.NewLine}" +
+                         $"Archivos enviados a la papelera: {result.TrashedFileCount:N0}{Environment.NewLine}" +
+                         $"Archivos fallidos: {result.FailedFileCount:N0}{Environment.NewLine}" +
+                         $"Espacio enviado a la papelera: {FileSizeFormatter.Format(result.TrashedBytes)}{Environment.NewLine}" +
+                         $"Historial: {historyPath}" +
+                         (result.Failure is null ? string.Empty : $"{Environment.NewLine}{Environment.NewLine}{result.Failure.Message}") +
+                         (mustRescan ? $"{Environment.NewLine}{Environment.NewLine}Google Drive ha cambiado. Ejecuta un nuevo análisis antes de continuar." : string.Empty);
+        lblEstado.Text = mustRescan
+            ? "Google Drive ha cambiado. Ejecuta un nuevo análisis antes de continuar."
+            : "No se modificó ningún archivo. Puedes corregir el problema y volver a intentar.";
+        MessageBox.Show(message, "Resultado de limpieza por lotes", MessageBoxButtons.OK,
+            result.Status is CleanupBatchStatus.Completed or CleanupBatchStatus.CompletedWithExclusions ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+    }
+
+    private static string DescribeBatchStatus(CleanupBatchStatus status) => status switch
+    {
+        CleanupBatchStatus.Completed => "Limpieza por lotes completada",
+        CleanupBatchStatus.CompletedWithExclusions => "Limpieza por lotes completada con grupos excluidos",
+        CleanupBatchStatus.CancelledBeforeChanges => "Limpieza por lotes cancelada antes de cambios",
+        CleanupBatchStatus.CancelledAfterChanges => "Limpieza por lotes cancelada después de cambios",
+        CleanupBatchStatus.FailedBeforeChanges => "Limpieza por lotes detenida antes de cambios",
+        CleanupBatchStatus.FailedAfterChanges => "Limpieza por lotes detenida después de cambios",
+        _ => "Limpieza por lotes pendiente"
+    };
+
     private IReadOnlyDictionary<string, DuplicateGroupReview> GetReviewsByStableId() =>
         _reviews.ToDictionary(review => review.StableId, StringComparer.Ordinal);
 
@@ -1337,17 +1576,18 @@ public partial class Form1 : Form
     private void SetBatchUiBusy(bool isBusy)
     {
         _batchOperationInProgress = isBusy;
-        dgvDuplicados.ReadOnly = isBusy;
-        dgvGrupoDetalle.ReadOnly = isBusy || _cleanupOperationInProgress;
-        txtNotas.ReadOnly = isBusy || _cleanupOperationInProgress;
-        btnAnteriorGrupo.Enabled = !isBusy;
-        btnSiguienteGrupo.Enabled = !isBusy;
-        btnSiguientePendiente.Enabled = !isBusy;
-        btnSiguienteListo.Enabled = !isBusy;
-        btnMarcarRevisado.Enabled = !isBusy;
-        btnGuardarRevision.Enabled = !isBusy;
-        btnVerPlan.Enabled = !isBusy;
-        btnExportarPlan.Enabled = !isBusy;
+        bool canReviewResults = !isBusy && !_scanResultsAreObsolete;
+        dgvDuplicados.ReadOnly = !canReviewResults;
+        dgvGrupoDetalle.ReadOnly = !canReviewResults || _cleanupOperationInProgress;
+        txtNotas.ReadOnly = !canReviewResults || _cleanupOperationInProgress;
+        btnAnteriorGrupo.Enabled = canReviewResults;
+        btnSiguienteGrupo.Enabled = canReviewResults;
+        btnSiguientePendiente.Enabled = canReviewResults;
+        btnSiguienteListo.Enabled = canReviewResults;
+        btnMarcarRevisado.Enabled = canReviewResults;
+        btnGuardarRevision.Enabled = canReviewResults;
+        btnVerPlan.Enabled = canReviewResults;
+        btnExportarPlan.Enabled = canReviewResults;
         RefreshRecommendationActionAvailability();
         RefreshBatchSelectionUi();
     }
@@ -1625,8 +1865,10 @@ public partial class Form1 : Form
                 operationProgress,
                 _cleanupCancellationTokenSource.Token);
 
-            _scanResultsAreObsolete = operation.ShouldInvalidateScan;
-            btnAbrirPapelera.Enabled = operation.ShouldInvalidateScan;
+            if (operation.ShouldInvalidateScan)
+            {
+                InvalidateResultsAfterDriveChange();
+            }
 
             ShowCleanupOutcome(operation);
         }
@@ -1745,6 +1987,7 @@ public partial class Form1 : Form
             btnActivarLimpieza.Enabled = false;
             btnDesactivarLimpieza.Enabled = false;
             btnEnviarGrupoPapelera.Enabled = false;
+            btnEnviarGruposPapelera.Enabled = false;
             btnAbrirPapelera.Enabled = false;
             btnRestablecerAutorizacionLimpieza.Enabled = false;
         }
@@ -1754,19 +1997,22 @@ public partial class Form1 : Form
         txtBuscarRevision.Enabled = !isBusy;
         chkSoloCompartidos.Enabled = !isBusy;
         chkMasDeDosCopias.Enabled = !isBusy;
-        dgvGrupoDetalle.ReadOnly = isBusy;
-        txtNotas.ReadOnly = isBusy;
-        btnAnteriorGrupo.Enabled = !isBusy;
-        btnSiguienteGrupo.Enabled = !isBusy;
-        btnSiguientePendiente.Enabled = !isBusy;
-        btnSiguienteListo.Enabled = !isBusy;
-        btnMarcarRevisado.Enabled = !isBusy;
-        btnGuardarRevision.Enabled = !isBusy;
-        btnVerPlan.Enabled = !isBusy;
-        btnExportarPlan.Enabled = !isBusy;
+        bool canReviewResults = !isBusy && !_scanResultsAreObsolete;
+        dgvDuplicados.ReadOnly = !canReviewResults;
+        dgvGrupoDetalle.ReadOnly = !canReviewResults;
+        txtNotas.ReadOnly = !canReviewResults;
+        btnAnteriorGrupo.Enabled = canReviewResults;
+        btnSiguienteGrupo.Enabled = canReviewResults;
+        btnSiguientePendiente.Enabled = canReviewResults;
+        btnSiguienteListo.Enabled = canReviewResults;
+        btnMarcarRevisado.Enabled = canReviewResults;
+        btnGuardarRevision.Enabled = canReviewResults;
+        btnVerPlan.Enabled = canReviewResults;
+        btnExportarPlan.Enabled = canReviewResults;
         btnSeleccionarVisibles.Enabled = !isBusy;
         btnDeseleccionarTodos.Enabled = !isBusy && _batchSelectedStableIds.Count > 0;
         btnAplicarRecomendacionesSeleccionadas.Enabled = !isBusy && _batchSelectedStableIds.Count > 0;
+        btnEnviarGruposPapelera.Enabled = !isBusy && _batchSelectedStableIds.Count > 0 && _cleanupModeActive && _cleanupDriveService is not null && !_scanResultsAreObsolete;
         btnDeshacerUltimoLote.Enabled = !isBusy && _recommendationBatchUndoSession.HasSnapshot;
         if (!isBusy)
         {

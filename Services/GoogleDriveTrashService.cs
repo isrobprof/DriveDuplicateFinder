@@ -220,7 +220,8 @@ public sealed class GoogleDriveTrashService
         CleanupHistoryService historyService,
         CleanupHistoryHandle history,
         IProgress<(int Current, int Total, string Name)>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Func<bool>? stopAfterCurrentFileRequested = null)
     {
         ArgumentNullException.ThrowIfNull(cleanupDriveService);
         ArgumentNullException.ThrowIfNull(preflight);
@@ -247,6 +248,22 @@ public sealed class GoogleDriveTrashService
         bool writeAttempted = false;
         for (int index = 0; index < preflight.CandidateFiles.Count; index++)
         {
+            if (stopAfterCurrentFileRequested?.Invoke() == true)
+            {
+                MarkRemainingAsNotProcessed(record, preflight.CandidateFiles, index);
+                record.Status = record.ProcessedFiles > 0 ? CleanupOperationStatus.Partial : CleanupOperationStatus.Cancelled;
+                record.FinishedAtUtc = DateTimeOffset.UtcNow;
+                record.SanitizedErrorMessage = "El usuario solicitó detener el proceso antes de enviar el siguiente archivo a la papelera.";
+                await historyService.SaveAsync(history, CancellationToken.None);
+                return new CleanupOperationResult
+                {
+                    Record = record,
+                    WriteAttempted = writeAttempted,
+                    ShouldInvalidateScan = record.ProcessedFiles > 0,
+                    NoFilesChanged = record.ProcessedFiles == 0
+                };
+            }
+
             CleanupFileSnapshot candidate = preflight.CandidateFiles[index];
             var fileResult = new CleanupFileResult { File = candidate };
             record.FileResults.Add(fileResult);

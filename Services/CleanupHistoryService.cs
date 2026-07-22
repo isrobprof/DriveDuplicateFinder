@@ -54,6 +54,31 @@ public sealed class CleanupHistoryService
         return WriteAtomicallyAsync(handle.Path, handle.Record, overwrite: true, cancellationToken);
     }
 
+    public async Task<CleanupBatchHistoryHandle> CreateBatchPendingAsync(
+        CleanupBatchPreview preview,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(preview);
+
+        var record = new CleanupBatchRecord
+        {
+            BatchId = preview.BatchId,
+            StartedAtUtc = DateTimeOffset.UtcNow,
+            Preview = preview
+        };
+        string filename = $"cleanup-batch-{record.StartedAtUtc:yyyyMMdd-HHmmss}-{record.BatchId:N}.json";
+        string path = Path.Combine(HistoryDirectory, filename);
+        var handle = new CleanupBatchHistoryHandle(path, record);
+        await WriteAtomicallyAsync(path, record, overwrite: false, cancellationToken);
+        return handle;
+    }
+
+    public Task SaveAsync(CleanupBatchHistoryHandle handle, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(handle);
+        return WriteAtomicallyAsync(handle.Path, handle.Record, overwrite: true, cancellationToken);
+    }
+
     private static CleanupFileSnapshot CreateSnapshot(DriveFileInfo file) => new()
     {
         Id = file.Id,
@@ -74,7 +99,7 @@ public sealed class CleanupHistoryService
 
     private static async Task WriteAtomicallyAsync(
         string destinationPath,
-        CleanupOperationRecord record,
+        object record,
         bool overwrite,
         CancellationToken cancellationToken)
     {
@@ -113,3 +138,5 @@ public sealed class CleanupHistoryService
 }
 
 public sealed record CleanupHistoryHandle(string Path, CleanupOperationRecord Record);
+
+public sealed record CleanupBatchHistoryHandle(string Path, CleanupBatchRecord Record);
