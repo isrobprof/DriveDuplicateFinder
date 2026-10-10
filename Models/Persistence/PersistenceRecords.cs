@@ -4,15 +4,19 @@ public enum ScanType { Full, Incremental }
 
 public enum ScanStatus { Pending, Running, Paused, Completed, Cancelled, Failed, Abandoned }
 
-public sealed class DriveFileCacheRecord
+public sealed record DriveFileCacheRecord
 {
     public required string FileId { get; init; }
     public required string Name { get; init; }
+    public string AccountKey { get; init; } = string.Empty;
+    public string ScopeKey { get; init; } = string.Empty;
     public string? NormalizedName { get; init; }
     public string? Extension { get; init; }
     public string? MimeType { get; init; }
     public long? SizeBytes { get; init; }
     public string? Md5Checksum { get; init; }
+    public long? Version { get; init; }
+    public IReadOnlyList<string> OwnerNames { get; init; } = Array.Empty<string>();
     public DateTimeOffset? ModifiedTimeUtc { get; init; }
     public DateTimeOffset? CreatedTimeUtc { get; init; }
     public IReadOnlyList<string> ParentIds { get; init; } = Array.Empty<string>();
@@ -28,9 +32,12 @@ public sealed class DriveFileCacheRecord
     public DateTimeOffset CachedAtUtc { get; init; }
 }
 
-public sealed class ScanSessionRecord
+public sealed record ScanSessionRecord
 {
     public required string ScanId { get; init; }
+    public string AccountKey { get; init; } = string.Empty;
+    public string ScopeKey { get; init; } = string.Empty;
+    public string? RootFolderId { get; init; }
     public ScanType ScanType { get; init; }
     public ScanStatus Status { get; init; }
     public DateTimeOffset StartedAtUtc { get; init; }

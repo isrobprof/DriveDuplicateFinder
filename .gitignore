@@ -5,3 +5,34 @@ obj/
 .vs/
 *.csproj.user
 *.suo
+
+# Bases SQLite locales y archivos auxiliares transaccionales.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Tokens OAuth, secretos y material de autenticación local.
+token*.json
+client_secret*.json
+.env
+.env.*
+*.pem
+*.p12
+*.key
+
+# Estado/datos privados locales y artefactos no versionables.
+/review-state.json
+/drive-private/
+/drive-data/
+*.log
+*.tmp
+*.temp
+*.bak

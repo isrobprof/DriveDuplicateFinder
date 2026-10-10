@@ -1,6 +1,7 @@
 using Google.Apis.Drive.v3;
 using GoogleFile = Google.Apis.Drive.v3.Data.File;
 using DriveDuplicateFinder.Models;
+using DriveDuplicateFinder.Models.Persistence;
 
 namespace DriveDuplicateFinder.Services;
 
@@ -124,6 +125,79 @@ public sealed class GoogleDriveFileService
         {
             ItemsExamined = itemsExamined,
             FilesWithoutMd5Ignored = filesWithoutMd5Ignored,
+            ComparableFilesCount = comparableFiles.Count,
+            ComparableFiles = comparableFiles
+        };
+    }
+
+    public async Task<string?> GetMyDriveRootIdAsync(DriveService driveService, CancellationToken cancellationToken = default)
+    {
+        RootDirectoryInfo roots = await GetRootDirectoriesAsync(driveService, cancellationToken);
+        return roots.MyDriveRootId;
+    }
+
+    public DriveScanResult BuildResultFromCache(
+        IReadOnlyCollection<DriveFileCacheRecord> records,
+        string? myDriveRootId,
+        CancellationToken cancellationToken = default)
+    {
+        var folders = new Dictionary<string, FolderInfo>(StringComparer.Ordinal);
+        var comparableFiles = new List<DriveFileInfo>();
+        int filesWithoutMd5Ignored = 0;
+        int itemsExamined = 0;
+
+        foreach (DriveFileCacheRecord record in records)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            itemsExamined++;
+            string mimeType = record.MimeType ?? string.Empty;
+            if (string.Equals(mimeType, FolderMimeType, StringComparison.Ordinal))
+            {
+                folders[record.FileId] = new FolderInfo(record.FileId, record.Name, record.ParentIds);
+                continue;
+            }
+
+            if (mimeType.StartsWith(GoogleWorkspaceMimeTypePrefix, StringComparison.Ordinal) ||
+                string.IsNullOrWhiteSpace(record.Md5Checksum))
+            {
+                filesWithoutMd5Ignored++;
+                continue;
+            }
+
+            if (record.SizeBytes is not long size || size < 0)
+            {
+                continue;
+            }
+
+            comparableFiles.Add(new DriveFileInfo
+            {
+                Id = record.FileId,
+                Name = record.Name,
+                MimeType = mimeType,
+                Size = size,
+                Md5Checksum = record.Md5Checksum,
+                ModifiedTime = record.ModifiedTimeUtc,
+                CreatedTime = record.CreatedTimeUtc,
+                ParentIds = record.ParentIds,
+                SharedDriveId = record.DriveId,
+                OwnerNames = record.OwnerNames,
+                IsShared = record.IsShared,
+                IsStarred = record.IsStarred,
+                OwnedByMe = record.OwnedByMe,
+                DriveId = record.DriveId,
+                Version = record.Version,
+                CanTrash = record.CanTrash
+            });
+        }
+
+        var rootNames = new Dictionary<string, string>(StringComparer.Ordinal) { ["root"] = "Mi unidad" };
+        if (!string.IsNullOrWhiteSpace(myDriveRootId)) rootNames[myDriveRootId] = "Mi unidad";
+        PopulatePaths(comparableFiles, folders, rootNames, myDriveRootId, cancellationToken);
+        return new DriveScanResult
+        {
+            ItemsExamined = itemsExamined,
+            FilesWithoutMd5Ignored = filesWithoutMd5Ignored,
+            ComparableFilesCount = comparableFiles.Count,
             ComparableFiles = comparableFiles
         };
     }

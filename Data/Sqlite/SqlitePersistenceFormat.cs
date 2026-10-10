@@ -18,4 +18,12 @@ internal static class SqlitePersistenceFormat
         if (string.IsNullOrWhiteSpace(value)) return Array.Empty<string>();
         return JsonSerializer.Deserialize<string[]>(value) ?? Array.Empty<string>();
     }
+
+    public static string ToOwnerNamesJson(IReadOnlyList<string> ownerNames) => JsonSerializer.Serialize(ownerNames ?? Array.Empty<string>());
+
+    public static IReadOnlyList<string> FromOwnerNamesJson(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return Array.Empty<string>();
+        return JsonSerializer.Deserialize<string[]>(value) ?? Array.Empty<string>();
+    }
 }

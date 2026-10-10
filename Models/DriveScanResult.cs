@@ -6,5 +6,7 @@ public sealed class DriveScanResult
 
     public required int FilesWithoutMd5Ignored { get; init; }
 
+    public int ComparableFilesCount { get; init; }
+
     public required IReadOnlyList<DriveFileInfo> ComparableFiles { get; init; }
 }

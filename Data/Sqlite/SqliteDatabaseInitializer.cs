@@ -11,7 +11,12 @@ public sealed class SqliteDatabaseInitializer
     public SqliteDatabaseInitializer(SqliteConnectionFactory connectionFactory, IEnumerable<ISqliteMigration>? migrations = null)
     {
         _connectionFactory = connectionFactory ?? throw new ArgumentNullException(nameof(connectionFactory));
-        _migrations = (migrations ?? [new Migration001InitialScanCache()])
+        _migrations = (migrations ?? [
+                new Migration001InitialScanCache(),
+                new Migration002RecoverableFullScans(),
+                new Migration003ReviewPersistence(),
+                new Migration004ExplicitReviewConfirmation()
+            ])
             .OrderBy(migration => migration.Version)
             .ToArray();
         if (_migrations.Select(migration => migration.Version).Distinct().Count() != _migrations.Count)

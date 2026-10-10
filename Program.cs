@@ -6,15 +6,19 @@ static class Program
     ///  The main entry point for the application.
     /// </summary>
     [STAThread]
-    static async Task Main(string[] args)
+    static void Main(string[] args)
     {
         if (args.Length == 1 && string.Equals(args[0], "--verify-sqlite-infrastructure", StringComparison.Ordinal))
         {
-            Data.Sqlite.SqliteInfrastructureCheckResult result =
-                await Data.Sqlite.SqliteInfrastructureLocalChecks.VerifyAsync();
-            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(
-                result,
-                new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            WinFormsStartupLocalChecks.EnsureStaThread();
+            VerifyAsync().GetAwaiter().GetResult();
+            return;
+        }
+
+        if (args.Length == 1 && string.Equals(args[0], "--demo-review", StringComparison.Ordinal))
+        {
+            ApplicationConfiguration.Initialize();
+            Application.Run(new Form1(demoMode: true));
             return;
         }
 
@@ -22,5 +26,21 @@ static class Program
         // see https://aka.ms/applicationconfiguration.
         ApplicationConfiguration.Initialize();
         Application.Run(new Form1());
+    }
+
+    private static async Task VerifyAsync()
+    {
+        var result = new
+        {
+            WinFormsSta = WinFormsStartupLocalChecks.Verify(),
+            Infrastructure = await Data.Sqlite.SqliteInfrastructureLocalChecks.VerifyAsync(),
+            RecoverableFullScan = await Data.Sqlite.RecoverableFullScanLocalChecks.VerifyAsync(),
+            ReviewStatePersistence = await Data.Sqlite.ReviewStatePersistenceLocalChecks.VerifyAsync(),
+            PagedReadOnlyView = Services.PagedReadOnlyViewLocalChecks.Verify(),
+            DemoReviewIsolation = await Services.DemoReviewData.VerifyIsolationAsync()
+        };
+        Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(
+            result,
+            new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
     }
 }

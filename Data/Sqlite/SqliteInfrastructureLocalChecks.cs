@@ -32,7 +32,8 @@ public static class SqliteInfrastructureLocalChecks
     [
         "DriveFiles", "ScanSessions", "ScanCheckpoints", "DriveChangeState",
         "ExactDuplicateGroups", "ExactDuplicateMembers",
-        "PossibleDuplicateGroups", "PossibleDuplicateMembers"
+        "PossibleDuplicateGroups", "PossibleDuplicateMembers",
+        "ReviewInventories", "ReviewGroupStates", "ReviewFileDecisions"
     ];
 
     private static readonly string[] ExpectedIndexes =
@@ -40,7 +41,10 @@ public static class SqliteInfrastructureLocalChecks
         "IX_DriveFiles_Size_Md5", "IX_DriveFiles_NormalizedName_Size",
         "IX_DriveFiles_Size_ModifiedTime", "IX_DriveFiles_LastSeenScanId",
         "IX_DriveFiles_IsTrashed_IsRemoved", "IX_ScanSessions_Status",
-        "IX_ExactDuplicateMembers_FileId", "IX_PossibleDuplicateMembers_FileId"
+        "IX_ExactDuplicateMembers_FileId", "IX_PossibleDuplicateMembers_FileId",
+        "IX_ScanSessions_Account_Scope_Status", "IX_DriveFiles_Account_Scope_LastSeen",
+        "IX_ReviewGroupStates_Inventory_Status", "IX_ReviewGroupStates_Inventory_Selected",
+        "IX_ReviewFileDecisions_Group_Decision"
     ];
 
     public static async Task<SqliteInfrastructureCheckResult> VerifyAsync(CancellationToken cancellationToken = default)
@@ -65,9 +69,9 @@ public static class SqliteInfrastructureLocalChecks
             await initializer.InitializeAsync(cancellationToken);
             await initializer.InitializeAsync(cancellationToken);
             SchemaSnapshot schema = await GetSchemaSnapshotAsync(factory, cancellationToken);
-            Assert(schema.MigrationVersions.SequenceEqual([1]), "La migración inicial no se registró exactamente una vez.");
-            Assert(schema.Tables.SequenceEqual(ExpectedTables.OrderBy(name => name, StringComparer.Ordinal), StringComparer.Ordinal), "Las tablas de la migración inicial no coinciden.");
-            Assert(schema.Indexes.SequenceEqual(ExpectedIndexes.OrderBy(name => name, StringComparer.Ordinal), StringComparer.Ordinal), "Los índices de la migración inicial no coinciden.");
+            Assert(schema.MigrationVersions.SequenceEqual([1, 2, 3, 4]), "Las migraciones 1 a 4 no se registraron exactamente una vez.");
+            Assert(schema.Tables.SequenceEqual(ExpectedTables.OrderBy(name => name, StringComparer.Ordinal), StringComparer.Ordinal), "Las tablas de las migraciones aplicadas no coinciden.");
+            Assert(schema.Indexes.SequenceEqual(ExpectedIndexes.OrderBy(name => name, StringComparer.Ordinal), StringComparer.Ordinal), "Los índices de las migraciones aplicadas no coinciden.");
             Assert(schema.ForeignKeys == 1, "PRAGMA foreign_keys debe ser 1.");
             Assert(string.Equals(schema.JournalMode, "wal", StringComparison.OrdinalIgnoreCase), "El journal debe estar en WAL.");
             Assert(schema.Synchronous == 2, "PRAGMA synchronous debe conservar FULL (2).");
@@ -87,7 +91,7 @@ public static class SqliteInfrastructureLocalChecks
 
             await initializer.InitializeAsync(cancellationToken);
             Assert(await files.CountAsync(cancellationToken) == 1, "La inicialización idempotente no debe borrar datos existentes.");
-            Assert((await GetSchemaSnapshotAsync(factory, cancellationToken)).MigrationVersions.SequenceEqual([1]), "La inicialización idempotente duplicó la migración.");
+            Assert((await GetSchemaSnapshotAsync(factory, cancellationToken)).MigrationVersions.SequenceEqual([1, 2, 3, 4]), "La inicialización idempotente duplicó una migración.");
 
             await VerifyIncompleteSessionsAsync(sessions, now, cancellationToken);
 

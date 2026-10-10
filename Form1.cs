@@ -1,6 +1,10 @@
 using System.Diagnostics;
 using System.ComponentModel;
+using System.Globalization;
+using DriveDuplicateFinder.Data.Sqlite;
+using DriveDuplicateFinder.Data.Sqlite.Repositories;
 using DriveDuplicateFinder.Models;
+using DriveDuplicateFinder.Models.Persistence;
 using DriveDuplicateFinder.Services;
 using DriveDuplicateFinder.Utilities;
 using Google.Apis.Drive.v3;
@@ -10,6 +14,11 @@ namespace DriveDuplicateFinder;
 public partial class Form1 : Form
 {
     private readonly GoogleDriveFileService _fileService = new();
+    private readonly bool _demoMode;
+    private readonly string? _demoDataDirectory;
+    private DemoReviewSeed? _demoSeed;
+    private readonly RecoverableFullScanService _recoverableFullScanService;
+    private readonly ReviewStateRepository _reviewStateRepository;
     private readonly DuplicateFinderService _duplicateFinderService = new();
     private readonly DuplicateReviewService _reviewService = new();
     private readonly KeepRecommendationService _recommendationService = new();
@@ -24,6 +33,7 @@ public partial class Form1 : Form
     private readonly Dictionary<string, KeepRecommendation> _recommendationsByGroupId = new(StringComparer.Ordinal);
     private readonly RecommendationUndoSession _recommendationUndoSession = new();
     private readonly RecommendationBatchUndoSession _recommendationBatchUndoSession = new();
+    private readonly PagedRequestGeneration _pagedRequestGeneration = new();
     private readonly HashSet<string> _batchSelectedStableIds = new(StringComparer.Ordinal);
     private readonly ToolTip _recommendationToolTip = new();
     private readonly System.Windows.Forms.Timer _reviewSaveTimer = new() { Interval = 1500 };
@@ -47,6 +57,20 @@ public partial class Form1 : Form
     private bool _cleanupOperationInProgress;
     private bool _scanResultsAreObsolete;
     private bool _batchOperationInProgress;
+    private bool _pagedReadOnlyMode;
+    private bool _isBindingPagedGroups;
+    private ScanInventoryIdentity? _pagedInventory;
+    private DuplicateGroupSummaryPage? _pagedGroupPage;
+    private DuplicateGroupIdentity? _activePagedGroup;
+    private int _pagedGroupOffset;
+    private int _pagedMemberOffset;
+    private long _pagedDuplicateGroupCount;
+    private long _pagedKeepCount;
+    private long _pagedCandidateCount;
+    private long _pagedUndecidedCount;
+    private long _pagedCurrentMemberCount;
+    private bool _isBindingPagedMembers;
+    private bool _pagedReviewWriteInProgress;
 
     private readonly GroupBox grpFiltros = new();
     private readonly ComboBox cmbFiltroEstado = new();
@@ -88,9 +112,35 @@ public partial class Form1 : Form
     private readonly Label lblModoLimpieza = new();
     private readonly Label lblElegibilidadLimpieza = new();
     private readonly Label lblSeleccionLote = new();
+    private readonly CheckBox chkLegacyFullScan = new();
+    private readonly GroupBox grpPagedGroups = new();
+    private readonly GroupBox grpPagedMembers = new();
+    private readonly DataGridView dgvPagedGroups = new();
+    private readonly DataGridView dgvPagedMembers = new();
+    private readonly Label lblPagedGroupPage = new();
+    private readonly Label lblPagedMembersPage = new();
+    private readonly Label lblPagedReadOnly = new();
+    private readonly Label lblWorkflowStep = new();
+    private readonly Button btnPagedPreviousGroupPage = new();
+    private readonly Button btnPagedNextGroupPage = new();
+    private readonly Button btnPagedPreviousMemberPage = new();
+    private readonly Button btnPagedNextMemberPage = new();
+    private readonly Button btnPagedConfirmGroup = new();
+    private readonly Button btnPagedSkipGroup = new();
+    private readonly Button btnPagedViewCleanupPlan = new();
+    private readonly Button btnReopenLatestScan = new();
+    private const int PagedGroupPageSize = 1;
+    private const int PagedMemberPageSize = 100;
 
-    public Form1()
+    public Form1() : this(demoMode: false) { }
+
+    public Form1(bool demoMode)
     {
+        WinFormsStartupLocalChecks.EnsureStaThread();
+        _demoMode = demoMode;
+        _demoDataDirectory = demoMode ? DemoReviewData.CreateTemporaryDirectoryPath() : null;
+        _recoverableFullScanService = new RecoverableFullScanService(_fileService, _demoDataDirectory);
+        _reviewStateRepository = new ReviewStateRepository(new SqliteConnectionFactory(new LocalDataPathService(_demoDataDirectory)));
         _recommendationBatchService = new RecommendationBatchService(_recommendationApplicationService, _reviewService);
         _cleanupBatchService = new CleanupBatchService(_trashService);
         InitializeComponent();
@@ -98,12 +148,28 @@ public partial class Form1 : Form
         FormClosing += Form1_FormClosing;
         Shown += Form1_Shown;
         _reviewSaveTimer.Tick += reviewSaveTimer_Tick;
+        if (_demoMode)
+        {
+            SetPagedReadOnlyMode(true);
+            btnConectar.Enabled = false;
+            btnConectar.Text = "Conexión deshabilitada";
+            btnBuscar.Enabled = false;
+            btnBuscar.Text = "Escaneo remoto deshabilitado";
+            btnReopenLatestScan.Enabled = false;
+            chkLegacyFullScan.Enabled = false;
+            lblTitulo.Text = "MODO DEMOSTRACIÓN — Drive Duplicate Finder";
+            lblDescripcion.Text = "Datos ficticios en SQLite temporal. Sin OAuth, escaneo remoto, preflight ni limpieza real.";
+            lblPagedReadOnly.Text = "MODO DEMOSTRACIÓN — decisiones únicamente locales; ningún cambio se enviará a Google Drive.";
+            Text = "DriveDuplicateFinder — MODO DEMOSTRACIÓN";
+        }
     }
 
     private async void btnConectar_Click(object? sender, EventArgs e)
     {
+        if (_demoMode) return;
         btnConectar.Enabled = false;
         btnBuscar.Enabled = false;
+        btnReopenLatestScan.Enabled = false;
         lblEstado.Text = "Conectando con Google Drive...";
         DriveService? newDriveService = null;
 
@@ -124,7 +190,9 @@ public partial class Form1 : Form
             newDriveService = null;
 
             lblEstado.Text = "Conectado correctamente con Google Drive.";
+            UpdateWorkflowStep(0, "Conectado; listo para analizar");
             btnBuscar.Enabled = true;
+            btnReopenLatestScan.Enabled = true;
 
             MessageBox.Show(
                 "Conexi\u00F3n realizada correctamente.",
@@ -151,36 +219,107 @@ public partial class Form1 : Form
 
     private async void btnBuscar_Click(object? sender, EventArgs e)
     {
+        if (_demoMode) return;
         if (_driveService is null)
         {
             lblEstado.Text = "Con\u00E9ctese con Google Drive antes de buscar duplicados.";
             return;
         }
 
+        if (chkLegacyFullScan.Checked && MessageBox.Show(
+                "El escaneo heredado carga en memoria todos los archivos comparables y grupos; con inventarios grandes puede consumir mucha memoria. ¿Continuar con esta ruta de compatibilidad?",
+                "Confirmar escaneo heredado",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning) != DialogResult.Yes)
+            return;
+
         btnConectar.Enabled = false;
         btnBuscar.Enabled = false;
+        btnReopenLatestScan.Enabled = false;
         btnCancelar.Enabled = true;
+        CancelPagedQueries();
+        SetPagedReadOnlyMode(false);
+        _pagedInventory = null;
+        _pagedGroupPage = null;
+        _activePagedGroup = null;
+        _pagedDuplicateGroupCount = 0;
+        _pagedGroupOffset = 0;
+        _pagedMemberOffset = 0;
         dgvDuplicados.DataSource = null;
+        dgvPagedGroups.DataSource = null;
+        dgvPagedMembers.DataSource = null;
         _recommendationBatchUndoSession.Clear();
         _batchSelectedStableIds.Clear();
         _searchCancellationTokenSource = new CancellationTokenSource();
+        _lastScanResult = null;
+        _scanResultsAreObsolete = true;
+        _reviews.Clear();
+        _recommendationsByGroupId.Clear();
+        _recommendationUndoSession.Clear();
+        _recommendationBatchUndoSession.Clear();
+        _batchSelectedStableIds.Clear();
+        _selectedReview = null;
+        RefreshReviewViews(null);
         RefreshRecommendationActionAvailability();
 
         try
         {
+            UpdateWorkflowStep(0, "Análisis en curso");
             var progress = new Progress<DriveScanProgress>(UpdateProgress);
+            if (!chkLegacyFullScan.Checked)
+            {
+                lblEstado.Text = "Preparando escaneo completo recuperable...";
+                FullScanPreparation preparation = await _recoverableFullScanService.PrepareAsync(
+                    _driveService,
+                    _searchCancellationTokenSource.Token);
+                ScanSessionRecord? resumeSession = preparation.IncompleteSession;
+                if (resumeSession is not null)
+                {
+                    DialogResult resumeChoice = MessageBox.Show(
+                        $"Hay un escaneo completo incompleto de esta cuenta y alcance.{Environment.NewLine}" +
+                        $"Páginas confirmadas: {resumeSession.ProcessedPageCount:N0}; elementos: {resumeSession.ProcessedItemCount:N0}.{Environment.NewLine}{Environment.NewLine}" +
+                        "Sí: reanudar. No: descartar y comenzar de nuevo. Cancelar: volver sin iniciar.",
+                        "Escaneo recuperable",
+                        MessageBoxButtons.YesNoCancel,
+                        MessageBoxIcon.Question);
+                    if (resumeChoice == DialogResult.Cancel)
+                    {
+                        lblEstado.Text = "Escaneo no iniciado.";
+                        return;
+                    }
+                    if (resumeChoice == DialogResult.No)
+                    {
+                        await _recoverableFullScanService.AbandonAsync(resumeSession, _searchCancellationTokenSource.Token);
+                        resumeSession = null;
+                    }
+                }
+
+                RecoverableFullScanResult completedScan = await _recoverableFullScanService.RunAsync(
+                    _driveService,
+                    preparation,
+                    resumeSession,
+                    progress,
+                    _searchCancellationTokenSource.Token);
+                await _reviewStateRepository.RegisterCompletedInventoryAsync(completedScan.Inventory, _searchCancellationTokenSource.Token);
+                ActivatePagedInventory(completedScan);
+                await LoadPagedGroupPageAsync(0);
+                progressBar.Style = ProgressBarStyle.Continuous;
+                progressBar.Value = 100;
+                lblEstado.Text = "Búsqueda paginada completada. Las decisiones de conservación se guardan localmente; limpieza deshabilitada.";
+                return;
+            }
+
+            // Ruta de compatibilidad: solo se ejecuta por selección explícita del usuario.
             DriveScanResult scanResult = await _fileService.GetComparableFilesAsync(
                 _driveService,
                 progress,
                 _searchCancellationTokenSource.Token);
-
             IReadOnlyList<DuplicateGroup> duplicateGroups = await Task.Run(
                 () => _duplicateFinderService.FindDuplicates(
                     scanResult.ComparableFiles,
                     progress,
                     _searchCancellationTokenSource.Token),
                 _searchCancellationTokenSource.Token);
-
             _reviews.Clear();
             _recommendationsByGroupId.Clear();
             _recommendationUndoSession.Clear();
@@ -214,18 +353,21 @@ public partial class Form1 : Form
             progressBar.Style = ProgressBarStyle.Continuous;
             progressBar.Value = 100;
             lblEstado.Text = "B\u00FAsqueda de duplicados completada.";
+            UpdateWorkflowStep(1, "Ruta heredada; revisión disponible");
         }
         catch (OperationCanceledException)
         {
             progressBar.Style = ProgressBarStyle.Continuous;
             progressBar.Value = 0;
             lblEstado.Text = "B\u00FAsqueda cancelada.";
+            UpdateWorkflowStep(0, "Análisis cancelado");
         }
         catch (Exception ex)
         {
             progressBar.Style = ProgressBarStyle.Continuous;
             progressBar.Value = 0;
             lblEstado.Text = "Error al buscar duplicados.";
+            UpdateWorkflowStep(0, "Análisis no completado");
 
             MessageBox.Show(
                 $"No se pudieron analizar los archivos de Google Drive.{Environment.NewLine}{Environment.NewLine}{ex.Message}",
@@ -239,15 +381,79 @@ public partial class Form1 : Form
             _searchCancellationTokenSource = null;
             btnConectar.Enabled = true;
             btnBuscar.Enabled = _driveService is not null;
+            btnReopenLatestScan.Enabled = _driveService is not null;
             btnCancelar.Enabled = false;
+            if (_pagedReadOnlyMode)
+                RefreshCleanupEligibility();
+            else
+                SetCleanupUiBusy(false);
             RefreshBatchSelectionUi();
         }
+    }
+
+    private async void btnReopenLatestScan_Click(object? sender, EventArgs e)
+    {
+        if (_demoMode) return;
+        if (_driveService is null) return;
+        btnReopenLatestScan.Enabled = false;
+        btnBuscar.Enabled = false;
+        btnConectar.Enabled = false;
+        btnCancelar.Enabled = true;
+        CancelPagedQueries();
+        try
+        {
+            lblEstado.Text = "Abriendo el último análisis Full completado de esta cuenta; no se iniciará un escaneo...";
+            var cancellation = new CancellationTokenSource();
+            _searchCancellationTokenSource = cancellation;
+            RecoverableFullScanResult result = await _recoverableFullScanService.OpenLatestCompletedAsync(_driveService, cancellation.Token);
+            await _reviewStateRepository.RegisterCompletedInventoryAsync(result.Inventory, cancellation.Token);
+            ActivatePagedInventory(result);
+            await LoadPagedGroupPageAsync(0);
+            lblEstado.Text = "Se reabrió el inventario local completado; no se ejecutó un escaneo.";
+        }
+        catch (OperationCanceledException)
+        {
+            lblEstado.Text = "Apertura del análisis cancelada.";
+        }
+        catch (Exception exception)
+        {
+            lblEstado.Text = "No se pudo reabrir el análisis completado.";
+            MessageBox.Show(exception.Message, "Reabrir análisis", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _searchCancellationTokenSource?.Dispose();
+            _searchCancellationTokenSource = null;
+            btnReopenLatestScan.Enabled = _driveService is not null;
+            btnBuscar.Enabled = _driveService is not null;
+            btnConectar.Enabled = true;
+            btnCancelar.Enabled = false;
+        }
+    }
+
+    private void ActivatePagedInventory(RecoverableFullScanResult result)
+    {
+        _lastScanResult = result.ScanResult;
+        _pagedInventory = result.Inventory;
+        _pagedDuplicateGroupCount = result.DuplicateGroupCount;
+        _pagedKeepCount = 0;
+        _pagedCandidateCount = 0;
+        _pagedUndecidedCount = 0;
+        _pagedCurrentMemberCount = 0;
+        _pagedReadOnlyMode = true;
+        _scanResultsAreObsolete = false;
+        _reviewChangesPending = false;
+        _reviewSaveTimer.Stop();
+        DeactivateCleanupMode(showStatus: false);
+        SetPagedReadOnlyMode(true);
+        UpdateWorkflowStep(1, "Revisión local grupo por grupo; recomendaciones y limpieza siguen bloqueadas.");
     }
 
     private void btnCancelar_Click(object? sender, EventArgs e)
     {
         _searchCancellationTokenSource?.Cancel();
         _cleanupCancellationTokenSource?.Cancel();
+        _pagedRequestGeneration.CancelCurrent();
     }
 
     private void InitializeReviewControls()
@@ -284,6 +490,7 @@ public partial class Form1 : Form
 
         ConfigureFilters();
         ConfigureReviewPanel();
+        ConfigurePagedPanels();
 
         var headerLayout = new TableLayoutPanel
         {
@@ -291,8 +498,9 @@ public partial class Form1 : Form
             ColumnCount = 1,
             Dock = DockStyle.Fill,
             Padding = new Padding(12, 10, 12, 8),
-            RowCount = 6
+            RowCount = 7
         };
+        headerLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         headerLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         headerLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         headerLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -303,6 +511,11 @@ public partial class Form1 : Form
         lblTitulo.Dock = DockStyle.Fill;
         lblDescripcion.AutoSize = true;
         lblDescripcion.Dock = DockStyle.Fill;
+        lblWorkflowStep.AutoSize = true;
+        lblWorkflowStep.Dock = DockStyle.Fill;
+        lblWorkflowStep.Padding = new Padding(8, 6, 8, 6);
+        lblWorkflowStep.BackColor = Color.AliceBlue;
+        lblWorkflowStep.Text = "1 Conectar y analizar   ›   2 Revisar   ›   3 Confirmar limpieza   ›   4 Resultados";
         lblEstado.AutoSize = true;
         lblEstado.Dock = DockStyle.Fill;
         progressBar.Dock = DockStyle.Fill;
@@ -313,16 +526,25 @@ public partial class Form1 : Form
             AutoSize = true,
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
+            WrapContents = true,
             Margin = new Padding(0, 8, 0, 0)
         };
         ConfigureHeaderButton(btnConectar);
         ConfigureHeaderButton(btnBuscar);
         ConfigureHeaderButton(btnCancelar);
+        btnReopenLatestScan.Text = "Reabrir último análisis";
+        btnReopenLatestScan.AutoSize = true;
+        btnReopenLatestScan.Enabled = false;
+        btnReopenLatestScan.Click += btnReopenLatestScan_Click;
         ConfigureButton(btnActivarLimpieza, "Activar modo limpieza", btnActivarLimpieza_Click);
         ConfigureButton(btnDesactivarLimpieza, "Desactivar modo limpieza", btnDesactivarLimpieza_Click);
         ConfigureButton(btnRestablecerAutorizacionLimpieza, "Restablecer autorización de limpieza", btnRestablecerAutorizacionLimpieza_Click);
-        commandPanel.Controls.AddRange([btnConectar, btnBuscar, btnCancelar, btnActivarLimpieza, btnDesactivarLimpieza, btnRestablecerAutorizacionLimpieza]);
+        chkLegacyFullScan.AutoSize = true;
+        chkLegacyFullScan.Text = "Ruta heredada (memoria completa)";
+        chkLegacyFullScan.Margin = new Padding(4, 6, 8, 0);
+        _recommendationToolTip.SetToolTip(chkLegacyFullScan,
+            "Compatibilidad explícita: carga todo el inventario y sus grupos en memoria. Déjala desmarcada para usar la consulta paginada SQLite.");
+        commandPanel.Controls.AddRange([btnConectar, btnBuscar, btnReopenLatestScan, btnCancelar, chkLegacyFullScan, btnActivarLimpieza, btnDesactivarLimpieza, btnRestablecerAutorizacionLimpieza]);
 
         lblModoLimpieza.AutoSize = true;
         lblModoLimpieza.Dock = DockStyle.Fill;
@@ -330,10 +552,11 @@ public partial class Form1 : Form
 
         headerLayout.Controls.Add(lblTitulo, 0, 0);
         headerLayout.Controls.Add(lblDescripcion, 0, 1);
-        headerLayout.Controls.Add(commandPanel, 0, 2);
-        headerLayout.Controls.Add(lblEstado, 0, 3);
-        headerLayout.Controls.Add(progressBar, 0, 4);
-        headerLayout.Controls.Add(lblModoLimpieza, 0, 5);
+        headerLayout.Controls.Add(lblWorkflowStep, 0, 2);
+        headerLayout.Controls.Add(commandPanel, 0, 3);
+        headerLayout.Controls.Add(lblEstado, 0, 4);
+        headerLayout.Controls.Add(progressBar, 0, 5);
+        headerLayout.Controls.Add(lblModoLimpieza, 0, 6);
 
         var leftLayout = new TableLayoutPanel
         {
@@ -385,6 +608,7 @@ public partial class Form1 : Form
         leftLayout.Controls.Add(grpFiltros, 0, 1);
         leftLayout.Controls.Add(batchSelectionPanel, 0, 2);
         leftLayout.Controls.Add(dgvDuplicados, 0, 3);
+        leftLayout.Controls.Add(grpPagedGroups, 0, 3);
 
         var rightLayout = new TableLayoutPanel
         {
@@ -395,6 +619,7 @@ public partial class Form1 : Form
         };
         rightLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
         rightLayout.Controls.Add(grpRevision, 0, 0);
+        rightLayout.Controls.Add(grpPagedMembers, 0, 0);
 
         var mainSplit = new SplitContainer
         {
@@ -423,9 +648,545 @@ public partial class Form1 : Form
         RefreshCleanupEligibility();
     }
 
-    private void Form1_Shown(object? sender, EventArgs e)
+    private async void Form1_Shown(object? sender, EventArgs e)
     {
         BeginInvoke(new Action(InitializeMainSplitLayout));
+        if (!_demoMode || _demoDataDirectory is null) return;
+        try
+        {
+            _demoSeed = await DemoReviewData.CreateAsync(_demoDataDirectory);
+            RecoverableFullScanResult result = await _recoverableFullScanService.OpenCompletedInventoryAsync(_demoSeed.Inventory);
+            ActivatePagedInventory(result);
+            SetPagedReadOnlyMode(true);
+            await LoadPagedGroupPageAsync(0);
+            lblEstado.Text = "Demo lista: inventario sintético; revisa grupos, páginas y plan local.";
+        }
+        catch (Exception exception)
+        {
+            lblEstado.Text = "No se pudo abrir la base temporal de demostración.";
+            MessageBox.Show(exception.Message, "Modo demostración", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void ConfigurePagedPanels()
+    {
+        grpPagedGroups.Text = "Duplicados exactos — páginas SQLite";
+        grpPagedGroups.Dock = DockStyle.Fill;
+        grpPagedGroups.Visible = false;
+        var groupLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(8) };
+        groupLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        groupLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        groupLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        lblPagedReadOnly.AutoSize = true;
+        lblPagedReadOnly.Text = "Revisión paginada local. Elige explícitamente Conservar, Enviar a papelera (candidato local) o Sin decidir. La vista previa es local; la limpieza real está deshabilitada.";
+        lblPagedReadOnly.ForeColor = Color.DarkRed;
+        lblPagedReadOnly.Dock = DockStyle.Fill;
+        ConfigurePagedGrid(dgvPagedGroups);
+        dgvPagedGroups.Columns.AddRange(
+        [
+            new DataGridViewTextBoxColumn { DataPropertyName = nameof(PagedGroupDisplayRow.RepresentativeName), HeaderText = "Archivo representativo", FillWeight = 140 },
+            new DataGridViewTextBoxColumn { DataPropertyName = nameof(PagedGroupDisplayRow.MemberCountText), HeaderText = "Copias", FillWeight = 50 },
+            new DataGridViewTextBoxColumn { DataPropertyName = nameof(PagedGroupDisplayRow.SizeText), HeaderText = "Tamaño", FillWeight = 75 },
+            new DataGridViewTextBoxColumn { DataPropertyName = nameof(PagedGroupDisplayRow.RecoverableText), HeaderText = "Recuperable", FillWeight = 85 },
+            new DataGridViewTextBoxColumn { DataPropertyName = nameof(PagedGroupDisplayRow.Checksum), HeaderText = "MD5", FillWeight = 130 }
+        ]);
+        dgvPagedGroups.SelectionChanged += dgvPagedGroups_SelectionChanged;
+        var groupNavigation = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true };
+        ConfigureButton(btnPagedPreviousGroupPage, "Grupo anterior", btnPagedPreviousGroupPage_Click);
+        ConfigureButton(btnPagedNextGroupPage, "Siguiente grupo", btnPagedNextGroupPage_Click);
+        lblPagedGroupPage.AutoSize = true;
+        lblPagedGroupPage.Padding = new Padding(4, 6, 0, 0);
+        groupNavigation.Controls.AddRange([btnPagedPreviousGroupPage, btnPagedNextGroupPage, lblPagedGroupPage]);
+        groupLayout.Controls.Add(lblPagedReadOnly, 0, 0);
+        groupLayout.Controls.Add(dgvPagedGroups, 0, 1);
+        groupLayout.Controls.Add(groupNavigation, 0, 2);
+        grpPagedGroups.Controls.Add(groupLayout);
+
+        grpPagedMembers.Text = "Miembros del grupo — revisión local paginada";
+        grpPagedMembers.Dock = DockStyle.Fill;
+        grpPagedMembers.Visible = false;
+        var memberLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(8) };
+        memberLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        memberLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        memberLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        ConfigurePagedGrid(dgvPagedMembers);
+        var pagedDecisionOptions = new[]
+        {
+            new DecisionOption(DuplicateFileDecision.Undecided, "SIN DECIDIR"),
+            new DecisionOption(DuplicateFileDecision.Keep, "CONSERVAR"),
+            new DecisionOption(DuplicateFileDecision.CandidateForTrash, "ENVIAR A PAPELERA (candidato local)")
+        };
+        dgvPagedMembers.Columns.AddRange(
+        [
+            new DataGridViewComboBoxColumn { DataPropertyName = nameof(PagedMemberDisplayRow.Decision), DataSource = pagedDecisionOptions, ValueMember = nameof(DecisionOption.Value), DisplayMember = nameof(DecisionOption.DisplayName), HeaderText = "Decisión local", Name = "colPagedDecision", FillWeight = 90, ReadOnly = false },
+            new DataGridViewTextBoxColumn { DataPropertyName = nameof(PagedMemberDisplayRow.Name), HeaderText = "Nombre", FillWeight = 100 },
+            new DataGridViewTextBoxColumn { DataPropertyName = nameof(PagedMemberDisplayRow.Path), HeaderText = "Ruta", FillWeight = 180 },
+            new DataGridViewTextBoxColumn { DataPropertyName = nameof(PagedMemberDisplayRow.SizeText), HeaderText = "Tamaño", FillWeight = 75 },
+            new DataGridViewTextBoxColumn { DataPropertyName = nameof(PagedMemberDisplayRow.ModifiedText), HeaderText = "Modificado", FillWeight = 90 },
+            new DataGridViewLinkColumn { DataPropertyName = nameof(PagedMemberDisplayRow.LocationText), HeaderText = "Drive", FillWeight = 70, TrackVisitedState = false }
+        ]);
+        dgvPagedMembers.ReadOnly = false;
+        foreach (DataGridViewColumn column in dgvPagedMembers.Columns)
+            column.ReadOnly = column.Name != "colPagedDecision";
+        dgvPagedMembers.EditMode = DataGridViewEditMode.EditOnEnter;
+        dgvPagedMembers.CurrentCellDirtyStateChanged += dgvPagedMembers_CurrentCellDirtyStateChanged;
+        dgvPagedMembers.CellValueChanged += dgvPagedMembers_CellValueChanged;
+        dgvPagedMembers.CellContentClick += dgvPagedMembers_CellContentClick;
+        var memberNavigation = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true };
+        ConfigureButton(btnPagedPreviousMemberPage, "Miembros anteriores", btnPagedPreviousMemberPage_Click);
+        ConfigureButton(btnPagedNextMemberPage, "Más miembros", btnPagedNextMemberPage_Click);
+        ConfigureButton(btnPagedConfirmGroup, "Confirmar revisión", btnPagedConfirmGroup_Click);
+        ConfigureButton(btnPagedSkipGroup, "Saltar grupo", btnPagedSkipGroup_Click);
+        ConfigureButton(btnPagedViewCleanupPlan, "Ver plan de limpieza", btnPagedViewCleanupPlan_Click);
+        lblPagedMembersPage.AutoSize = true;
+        lblPagedMembersPage.Padding = new Padding(4, 6, 0, 0);
+        memberNavigation.Controls.AddRange([btnPagedPreviousMemberPage, btnPagedNextMemberPage, btnPagedConfirmGroup, btnPagedSkipGroup, btnPagedViewCleanupPlan, lblPagedMembersPage]);
+        var reviewNotice = new Label
+        {
+            AutoSize = true,
+            Dock = DockStyle.Fill,
+            ForeColor = Color.DarkSlateBlue,
+            Text = "Solo las decisiones explícitas se guardan. Los miembros ocultos o sin decidir quedan fuera del plan; la vista previa no consulta ni modifica Google Drive."
+        };
+        memberLayout.Controls.Add(reviewNotice, 0, 0);
+        memberLayout.Controls.Add(dgvPagedMembers, 0, 1);
+        memberLayout.Controls.Add(memberNavigation, 0, 2);
+        grpPagedMembers.Controls.Add(memberLayout);
+        UpdatePagedNavigationUi();
+    }
+
+    private static void ConfigurePagedGrid(DataGridView grid)
+    {
+        grid.Dock = DockStyle.Fill;
+        grid.AllowUserToAddRows = false;
+        grid.AllowUserToDeleteRows = false;
+        grid.AllowUserToResizeRows = false;
+        grid.AutoGenerateColumns = false;
+        grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        grid.ReadOnly = true;
+        grid.MultiSelect = false;
+        grid.RowHeadersVisible = false;
+        grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        grid.EditMode = DataGridViewEditMode.EditProgrammatically;
+        grid.ScrollBars = ScrollBars.Both;
+    }
+
+    private void SetPagedReadOnlyMode(bool active)
+    {
+        _pagedReadOnlyMode = active;
+        grpFiltros.Visible = !active;
+        dgvDuplicados.Visible = !active;
+        grpRevision.Visible = !active;
+        grpPagedGroups.Visible = active;
+        grpPagedMembers.Visible = active;
+        if (btnSeleccionarVisibles.Parent is Control preparationRow) preparationRow.Visible = !active;
+        if (btnEnviarGruposPapelera.Parent is Control cleanupRow) cleanupRow.Visible = !active;
+        txtNotas.ReadOnly = active;
+        dgvGrupoDetalle.ReadOnly = active;
+        btnActivarLimpieza.Enabled = !active && !_cleanupModeActive && !_cleanupOperationInProgress;
+        btnDesactivarLimpieza.Enabled = !active && _cleanupModeActive && !_cleanupOperationInProgress;
+        btnRestablecerAutorizacionLimpieza.Enabled = !active && !_cleanupModeActive && !_cleanupOperationInProgress;
+        btnEnviarGrupoPapelera.Enabled = !active && btnEnviarGrupoPapelera.Enabled;
+        btnEnviarGruposPapelera.Enabled = !active && btnEnviarGruposPapelera.Enabled;
+        btnAplicarRecomendacion.Enabled = !active && btnAplicarRecomendacion.Enabled;
+        btnDeshacerRecomendacion.Enabled = !active && btnDeshacerRecomendacion.Enabled;
+        btnAplicarRecomendacionesSeleccionadas.Enabled = !active && btnAplicarRecomendacionesSeleccionadas.Enabled;
+        btnDeshacerUltimoLote.Enabled = !active && btnDeshacerUltimoLote.Enabled;
+        btnMarcarRevisado.Enabled = !active && btnMarcarRevisado.Enabled;
+        btnGuardarRevision.Enabled = !active && btnGuardarRevision.Enabled;
+        btnVerPlan.Enabled = !active && btnVerPlan.Enabled;
+        btnExportarPlan.Enabled = !active && btnExportarPlan.Enabled;
+        btnAbrirPapelera.Enabled = !active && btnAbrirPapelera.Enabled;
+        if (active)
+        {
+            _reviewSaveTimer.Stop();
+            _reviewChangesPending = false;
+            _cleanupModeActive = false;
+            _cleanupDriveService?.Dispose();
+            _cleanupDriveService = null;
+            btnAnteriorGrupo.Enabled = false;
+            btnSiguienteGrupo.Enabled = false;
+            btnSiguientePendiente.Enabled = false;
+            btnSiguienteListo.Enabled = false;
+            lblModoLimpieza.Text = "REVISIÓN PAGINADA: decisiones locales habilitadas; recomendaciones y limpieza real deshabilitadas.";
+            lblModoLimpieza.BackColor = Color.LemonChiffon;
+            lblModoLimpieza.ForeColor = Color.DarkRed;
+            lblElegibilidadLimpieza.Text = "La ruta paginada no permite operaciones de limpieza.";
+            lblElegibilidadLimpieza.ForeColor = Color.DarkRed;
+        }
+        RefreshCleanupEligibility();
+        UpdatePagedNavigationUi();
+    }
+
+    private async Task LoadPagedGroupPageAsync(int offset)
+    {
+        if (!_pagedReadOnlyMode || _pagedInventory is null) return;
+        PagedRequestLease request = _pagedRequestGeneration.Begin();
+        CancellationToken cancellationToken = request.Token;
+        btnCancelar.Enabled = true;
+        btnPagedPreviousGroupPage.Enabled = false;
+        btnPagedNextGroupPage.Enabled = false;
+        lblPagedGroupPage.Text = "Cargando grupos…";
+        dgvPagedMembers.Enabled = false;
+        try
+        {
+            DuplicateGroupSummaryPage page = await _recoverableFullScanService.GetDuplicateGroupSummariesPageAsync(
+                _pagedInventory, offset, PagedGroupPageSize, cancellationToken);
+            if (!_pagedRequestGeneration.IsCurrent(request)) return;
+            if (page.Items.Count == 0 && page.TotalCount > 0)
+                throw new InvalidOperationException($"SQLite informó {page.TotalCount:N0} grupos, pero no devolvió el grupo solicitado (offset {offset}). Se conserva la página anterior.");
+
+            _pagedGroupPage = page;
+            _pagedGroupOffset = page.Offset;
+            _pagedDuplicateGroupCount = page.TotalCount;
+            _activePagedGroup = page.Items.FirstOrDefault()?.Identity;
+            _pagedKeepCount = 0;
+            _pagedCandidateCount = 0;
+            _pagedUndecidedCount = 0;
+            _pagedCurrentMemberCount = 0;
+            _isBindingPagedGroups = true;
+            try
+            {
+                dgvPagedGroups.DataSource = new BindingList<PagedGroupDisplayRow>(page.Items.Select(item => new PagedGroupDisplayRow(
+                    item.Identity,
+                    item.RepresentativeName,
+                    item.MemberCount.ToString("N0", CultureInfo.CurrentCulture),
+                    FileSizeFormatter.Format(item.Identity.SizeBytes),
+                    FileSizeFormatter.Format(item.RecoverableBytes),
+                    item.Identity.NormalizedChecksum)).ToList());
+                if (dgvPagedGroups.Rows.Count > 0)
+                {
+                    dgvPagedGroups.ClearSelection();
+                    dgvPagedGroups.Rows[0].Selected = true;
+                    dgvPagedGroups.CurrentCell = dgvPagedGroups.Rows[0].Cells[0];
+                }
+            }
+            finally
+            {
+                _isBindingPagedGroups = false;
+            }
+
+            _pagedMemberOffset = 0;
+            if (_activePagedGroup is not null)
+            {
+                dgvPagedMembers.DataSource = null;
+                lblPagedMembersPage.Text = "Cargando miembros del grupo…";
+                try
+                {
+                    await LoadPagedMembersPageCoreAsync(_activePagedGroup, 0, request);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch (Exception exception) when (_pagedRequestGeneration.IsCurrent(request))
+                {
+                    dgvPagedMembers.DataSource = null;
+                    lblPagedMembersPage.Text = "No se pudieron cargar los miembros; el grupo sigue disponible.";
+                    MessageBox.Show(exception.Message, "Error al cargar miembros del grupo", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+            else
+            {
+                dgvPagedMembers.DataSource = null;
+                lblPagedMembersPage.Text = page.TotalCount == 0
+                    ? "No hay grupos duplicados en este inventario."
+                    : "SQLite no devolvió el grupo solicitado; no se descartó la página anterior.";
+            }
+            if (!_pagedRequestGeneration.IsCurrent(request)) return;
+            UpdatePagedSummaryText();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (_pagedReadOnlyMode && !_pagedRequestGeneration.HasActiveRequest)
+                lblPagedGroupPage.Text = "Consulta de grupos cancelada.";
+        }
+        catch (Exception exception)
+        {
+            if (_pagedRequestGeneration.IsCurrent(request))
+            {
+                lblPagedGroupPage.Text = "Error al cambiar de grupo; se conserva la selección anterior.";
+                MessageBox.Show(
+                    $"No se pudo consultar la página solicitada del inventario SQLite. Se conserva la página anterior y no se usarán resultados en memoria.{Environment.NewLine}{Environment.NewLine}{exception.Message}",
+                    "Error de consulta paginada",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+        finally
+        {
+            _pagedRequestGeneration.Complete(request);
+            btnCancelar.Enabled = _searchCancellationTokenSource is not null || _pagedRequestGeneration.HasActiveRequest;
+            UpdatePagedNavigationUi();
+        }
+    }
+
+    private async Task LoadPagedMembersPageAsync(DuplicateGroupIdentity identity, int offset)
+    {
+        if (!_pagedReadOnlyMode || _pagedInventory is null || identity.Inventory != _pagedInventory) return;
+        PagedRequestLease request = _pagedRequestGeneration.Begin();
+        btnCancelar.Enabled = true;
+        _activePagedGroup = identity;
+        _pagedMemberOffset = offset;
+        _pagedKeepCount = 0;
+        _pagedCandidateCount = 0;
+        _pagedUndecidedCount = 0;
+        _pagedCurrentMemberCount = 0;
+        dgvPagedMembers.DataSource = null;
+        dgvPagedMembers.Enabled = false;
+        lblPagedMembersPage.Text = "Cargando miembros…";
+        try
+        {
+            await LoadPagedMembersPageCoreAsync(identity, offset, request);
+        }
+        catch (OperationCanceledException) when (request.Token.IsCancellationRequested)
+        {
+            if (_pagedReadOnlyMode && !_pagedRequestGeneration.HasActiveRequest)
+                lblPagedMembersPage.Text = "Consulta de miembros cancelada.";
+        }
+        catch (Exception exception)
+        {
+            if (_pagedRequestGeneration.IsCurrent(request))
+            {
+                dgvPagedMembers.DataSource = null;
+                lblPagedMembersPage.Text = "No se pudo consultar la página de miembros; no se usarán datos alternativos.";
+                MessageBox.Show(exception.Message, "Error de consulta paginada", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+        finally
+        {
+            _pagedRequestGeneration.Complete(request);
+            btnCancelar.Enabled = _searchCancellationTokenSource is not null || _pagedRequestGeneration.HasActiveRequest;
+            UpdatePagedNavigationUi();
+        }
+    }
+
+    private async Task LoadPagedMembersPageCoreAsync(
+        DuplicateGroupIdentity identity,
+        int offset,
+        PagedRequestLease request)
+    {
+        lblPagedMembersPage.Text = "Cargando miembros…";
+        _isBindingPagedMembers = true;
+        dgvPagedMembers.Enabled = false;
+        try
+        {
+            RecoverableGroupMembersDisplayPage page = await _recoverableFullScanService.GetDuplicateGroupMembersDisplayPageAsync(
+                identity, offset, PagedMemberPageSize, request.Token);
+            if (!_pagedRequestGeneration.IsCurrent(request) || !_pagedReadOnlyMode || identity.Inventory != _pagedInventory) return;
+            _pagedMemberOffset = page.Offset;
+            dgvPagedMembers.DataSource = new BindingList<PagedMemberDisplayRow>(page.Items.Select(file => new PagedMemberDisplayRow(
+                file.Id, file.Name, file.Path, FileSizeFormatter.Format(file.Size),
+                file.ModifiedTime?.ToLocalTime().ToString("g") ?? "No disponible", file.ParentFolderUrl, DuplicateFileDecision.Undecided)).ToList());
+            if (page.TotalCount == 0)
+            {
+                lblPagedMembersPage.Text = "El grupo ya no contiene miembros en el inventario vigente.";
+                return;
+            }
+
+            ReviewGroupPersistenceState groupState = await _reviewStateRepository.RegisterGroupAsync(identity, request.Token);
+            PersistedFileDecisionPage decisions = await _reviewStateRepository.GetDecisionsPageAsync(identity, offset, PagedMemberPageSize, request.Token);
+            ReviewDecisionCounts counts = await _reviewStateRepository.GetGroupDecisionCountsAsync(identity, request.Token);
+            if (!_pagedRequestGeneration.IsCurrent(request)) return;
+            var decisionsByFileId = decisions.Items.ToDictionary(item => item.FileId, item => item.Decision, StringComparer.Ordinal);
+            foreach (DataGridViewRow gridRow in dgvPagedMembers.Rows)
+            {
+                if (gridRow.DataBoundItem is not PagedMemberDisplayRow row || !decisionsByFileId.TryGetValue(row.FileId, out DuplicateFileDecision decision))
+                    throw new InvalidOperationException("La página de decisiones no coincide con los FileId visibles del grupo.");
+                row.Decision = decision;
+                gridRow.Cells["colPagedDecision"].Value = decision;
+            }
+            dgvPagedMembers.Refresh();
+            _pagedKeepCount = counts.KeepCount;
+            _pagedCandidateCount = counts.CandidateCount;
+            _pagedUndecidedCount = counts.UndecidedCount;
+            _pagedCurrentMemberCount = counts.MemberCount;
+            lblPagedMembersPage.Text = $"Miembros {page.Offset + 1:N0}–{page.Offset + page.Items.Count:N0} de {page.TotalCount:N0} | página {page.Offset / PagedMemberPageSize + 1:N0} de {Math.Max(1, (page.TotalCount + PagedMemberPageSize - 1) / PagedMemberPageSize)} | Conservar: {counts.KeepCount:N0} | candidatos ya registrados: {counts.CandidateCount:N0} | sin decidir: {counts.UndecidedCount:N0} | revisión {(groupState.IsReviewConfirmed ? "confirmada" : "pendiente")}";
+            UpdatePagedNavigationUi();
+        }
+        finally
+        {
+            if (_pagedRequestGeneration.IsCurrent(request))
+            {
+                _isBindingPagedMembers = false;
+                dgvPagedMembers.Enabled = _pagedReadOnlyMode && _activePagedGroup is not null && !_pagedReviewWriteInProgress;
+            }
+        }
+    }
+
+    private void UpdatePagedSummaryText()
+    {
+        if (_lastScanResult is null || _pagedInventory is null) return;
+        lblResumen.Text = $"Full completado | Elementos: {_lastScanResult.ItemsExamined:N0} | Comparables: {_lastScanResult.ComparableFilesCount:N0} | Sin MD5: {_lastScanResult.FilesWithoutMd5Ignored:N0}{Environment.NewLine}" +
+            $"Grupos exactos: {_pagedDuplicateGroupCount:N0} | Inventario: {_pagedInventory.ScanId}";
+        UpdateWorkflowStep(1, "Revisar grupo por grupo; las decisiones se guardan localmente y la limpieza permanece bloqueada.");
+    }
+
+    private void UpdateWorkflowStep(int activeStep, string status)
+    {
+        string[] steps = ["Conectar y analizar", "Revisar", "Confirmar limpieza", "Resultados"];
+        lblWorkflowStep.Text = string.Join("   ›   ", steps.Select((step, index) =>
+            index < activeStep ? $"✓ {step}" : index == activeStep ? $"● {step}" : $"○ {step}")) +
+            $"     |     {status}";
+    }
+
+    private void UpdatePagedNavigationUi()
+    {
+        if (IsDisposed || Disposing) return;
+        long groupTotal = _pagedGroupPage?.TotalCount ?? _pagedDuplicateGroupCount;
+        int groupCount = _pagedGroupPage?.Items.Count ?? 0;
+        int groupNumber = groupTotal == 0 ? 0 : _pagedGroupOffset + 1;
+        string range = groupCount == 0 ? "No hay grupos" : $"Grupo {groupNumber:N0} de {groupTotal:N0}";
+        bool groupPageLoaded = _pagedGroupPage is not null;
+        lblPagedGroupPage.Text = _pagedReadOnlyMode ? range : string.Empty;
+        btnPagedPreviousGroupPage.Enabled = _pagedReadOnlyMode && groupPageLoaded && PagedReadOnlyViewSafety.HasPreviousPage(_pagedGroupOffset);
+        btnPagedNextGroupPage.Enabled = _pagedReadOnlyMode && groupPageLoaded &&
+            PagedReadOnlyViewSafety.HasNextPage(_pagedGroupOffset, groupCount, groupTotal);
+        bool hasMembers = _activePagedGroup is not null;
+        btnPagedPreviousMemberPage.Enabled = _pagedReadOnlyMode && hasMembers && _pagedMemberOffset > 0;
+        btnPagedNextMemberPage.Enabled = _pagedReadOnlyMode && hasMembers &&
+            (long)_pagedMemberOffset + (dgvPagedMembers.Rows.Count) < _pagedCurrentMemberCount;
+        btnPagedConfirmGroup.Enabled = _pagedReadOnlyMode && hasMembers && !_pagedReviewWriteInProgress && _pagedKeepCount > 0 && _pagedCandidateCount > 0;
+        btnPagedSkipGroup.Enabled = _pagedReadOnlyMode && hasMembers && !_pagedReviewWriteInProgress;
+        btnPagedViewCleanupPlan.Enabled = _pagedReadOnlyMode && _pagedInventory is not null && !_pagedReviewWriteInProgress;
+        dgvPagedMembers.Enabled = _pagedReadOnlyMode && hasMembers && !_pagedReviewWriteInProgress;
+    }
+
+    private void CancelPagedQueries() => _pagedRequestGeneration.CancelCurrent();
+
+    private void dgvPagedGroups_SelectionChanged(object? sender, EventArgs e)
+    {
+        if (!_pagedReadOnlyMode || _isBindingPagedGroups || dgvPagedGroups.CurrentRow?.DataBoundItem is not PagedGroupDisplayRow row ||
+            row.Identity == _activePagedGroup)
+            return;
+        _ = LoadPagedMembersPageAsync(row.Identity, 0);
+    }
+
+    private void dgvPagedMembers_CellContentClick(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (e.RowIndex < 0 || e.ColumnIndex < 0 ||
+            dgvPagedMembers.Columns[e.ColumnIndex].DataPropertyName != nameof(PagedMemberDisplayRow.LocationText) ||
+            dgvPagedMembers.Rows[e.RowIndex].DataBoundItem is not PagedMemberDisplayRow row)
+            return;
+
+        OpenLocation(row.ParentFolderUrl);
+    }
+
+    private void dgvPagedMembers_CurrentCellDirtyStateChanged(object? sender, EventArgs e)
+    {
+        if (dgvPagedMembers.IsCurrentCellDirty && dgvPagedMembers.CurrentCell is DataGridViewComboBoxCell)
+            dgvPagedMembers.CommitEdit(DataGridViewDataErrorContexts.Commit);
+    }
+
+    private async void dgvPagedMembers_CellValueChanged(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (!_pagedReadOnlyMode || _isBindingPagedMembers || _pagedReviewWriteInProgress || e.RowIndex < 0 || e.ColumnIndex < 0 ||
+            dgvPagedMembers.Columns[e.ColumnIndex].Name != "colPagedDecision" ||
+            _activePagedGroup is not DuplicateGroupIdentity identity ||
+            dgvPagedMembers.Rows[e.RowIndex].DataBoundItem is not PagedMemberDisplayRow row)
+            return;
+
+        if (dgvPagedMembers.Rows[e.RowIndex].Cells[e.ColumnIndex].Value is not DuplicateFileDecision decision) return;
+        row.Decision = decision;
+        PagedRequestLease request = _pagedRequestGeneration.Begin();
+        _pagedReviewWriteInProgress = true;
+        UpdatePagedNavigationUi();
+        btnCancelar.Enabled = true;
+        try
+        {
+            await _reviewStateRepository.SetExplicitDecisionAsync(identity, row.FileId, decision, request.Token);
+            if (_pagedRequestGeneration.IsCurrent(request))
+            {
+                _pagedReviewWriteInProgress = false;
+                await LoadPagedMembersPageCoreAsync(identity, _pagedMemberOffset, request);
+            }
+        }
+        catch (OperationCanceledException) when (request.Token.IsCancellationRequested) { }
+        catch (Exception exception)
+        {
+            if (_pagedRequestGeneration.IsCurrent(request))
+            {
+                MessageBox.Show(exception.Message, "No se pudo guardar la decisión local", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                _pagedReviewWriteInProgress = false;
+                await LoadPagedMembersPageCoreAsync(identity, _pagedMemberOffset, request);
+            }
+        }
+        finally
+        {
+            _pagedReviewWriteInProgress = false;
+            _pagedRequestGeneration.Complete(request);
+            UpdatePagedNavigationUi();
+        }
+    }
+
+    private async void btnPagedConfirmGroup_Click(object? sender, EventArgs e)
+    {
+        if (_activePagedGroup is not DuplicateGroupIdentity identity || _pagedKeepCount < 1 || _pagedCandidateCount < 1)
+        {
+            MessageBox.Show("Marca explícitamente al menos un archivo para conservar y otro para enviar a papelera como candidato local.", "Revisión incompleta", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (MessageBox.Show(
+                $"¿Confirmar las decisiones actuales para este grupo de {_pagedCurrentMemberCount:N0} archivos? Hay {_pagedKeepCount:N0} conservados explícitamente, {_pagedCandidateCount:N0} candidatos explícitos y {_pagedUndecidedCount:N0} sin decidir. Los pendientes quedan fuera del plan. No se enviará nada a la papelera.",
+                "Confirmar revisión del grupo", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            return;
+
+        PagedRequestLease request = _pagedRequestGeneration.Begin();
+        _pagedReviewWriteInProgress = true;
+        UpdatePagedNavigationUi();
+        try
+        {
+            await _reviewStateRepository.ConfirmGroupReviewAsync(identity, request.Token);
+            if (!_pagedRequestGeneration.IsCurrent(request)) return;
+            lblEstado.Text = "Revisión del grupo confirmada y guardada localmente.";
+            await LoadPagedMembersPageCoreAsync(identity, _pagedMemberOffset, request);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            if (_pagedRequestGeneration.IsCurrent(request))
+                MessageBox.Show(exception.Message, "No se pudo confirmar la revisión", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _pagedReviewWriteInProgress = false;
+            _pagedRequestGeneration.Complete(request);
+            UpdatePagedNavigationUi();
+        }
+    }
+
+    private async void btnPagedSkipGroup_Click(object? sender, EventArgs e)
+    {
+        if (_pagedGroupPage is null || _activePagedGroup is null) return;
+        int nextOffset = _pagedGroupOffset + PagedGroupPageSize;
+        if (nextOffset >= _pagedGroupPage.TotalCount)
+        {
+            lblEstado.Text = "No hay más grupos; el salto no modificó el estado de revisión.";
+            return;
+        }
+        lblEstado.Text = "Grupo saltado sin confirmar ni cambiar decisiones.";
+        await LoadPagedGroupPageAsync(nextOffset);
+    }
+
+    private void btnPagedViewCleanupPlan_Click(object? sender, EventArgs e)
+    {
+        if (!_pagedReadOnlyMode || _pagedInventory is null || _pagedReviewWriteInProgress) return;
+        using var preview = new PagedCleanupPlanPreviewForm(_recoverableFullScanService, _pagedInventory);
+        preview.ShowDialog(this);
+    }
+
+    private async void btnPagedPreviousGroupPage_Click(object? sender, EventArgs e) =>
+        await LoadPagedGroupPageAsync(Math.Max(0, _pagedGroupOffset - PagedGroupPageSize));
+
+    private async void btnPagedNextGroupPage_Click(object? sender, EventArgs e) =>
+        await LoadPagedGroupPageAsync(_pagedGroupOffset + PagedGroupPageSize);
+
+    private async void btnPagedPreviousMemberPage_Click(object? sender, EventArgs e)
+    {
+        if (_activePagedGroup is not null)
+            await LoadPagedMembersPageAsync(_activePagedGroup, Math.Max(0, _pagedMemberOffset - PagedMemberPageSize));
+    }
+
+    private async void btnPagedNextMemberPage_Click(object? sender, EventArgs e)
+    {
+        if (_activePagedGroup is not null)
+            await LoadPagedMembersPageAsync(_activePagedGroup, _pagedMemberOffset + PagedMemberPageSize);
     }
 
     private void InitializeMainSplitLayout()
@@ -797,7 +1558,7 @@ public partial class Form1 : Form
 
     private void dgvDuplicados_CellValueChanged(object? sender, DataGridViewCellEventArgs e)
     {
-        if (_isRefreshingReviewControls || e.RowIndex < 0 || e.ColumnIndex != colSeleccionLote.Index ||
+        if (!IsLegacyActionsAllowed || _isRefreshingReviewControls || e.RowIndex < 0 || e.ColumnIndex != colSeleccionLote.Index ||
             dgvDuplicados.Rows[e.RowIndex].DataBoundItem is not ReviewGroupRow row)
         {
             return;
@@ -817,6 +1578,7 @@ public partial class Form1 : Form
 
     private void btnSeleccionarVisibles_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         foreach (DuplicateGroupReview review in _filteredReviews)
         {
             _batchSelectedStableIds.Add(review.StableId);
@@ -827,6 +1589,7 @@ public partial class Form1 : Form
 
     private void btnDeseleccionarTodos_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         _batchSelectedStableIds.Clear();
         RefreshReviewViews(_selectedReview?.StableId);
     }
@@ -835,16 +1598,16 @@ public partial class Form1 : Form
     {
         int visibleSelected = _filteredReviews.Count(review => _batchSelectedStableIds.Contains(review.StableId));
         lblSeleccionLote.Text = $"Seleccionados: {_batchSelectedStableIds.Count} (visibles: {visibleSelected})";
-        bool canChangeSelection = _filteredReviews.Count > 0 && _searchCancellationTokenSource is null &&
+        bool canChangeSelection = IsLegacyActionsAllowed && _filteredReviews.Count > 0 && _searchCancellationTokenSource is null &&
             !_cleanupOperationInProgress && !_batchOperationInProgress && !_closeAfterSave;
-        bool interactionAllowed = _batchSelectedStableIds.Count > 0 && _searchCancellationTokenSource is null &&
+        bool interactionAllowed = IsLegacyActionsAllowed && _batchSelectedStableIds.Count > 0 && _searchCancellationTokenSource is null &&
             !_cleanupOperationInProgress && !_batchOperationInProgress && !_scanResultsAreObsolete && !_closeAfterSave && !_reviewStateIsCorrupt;
         btnSeleccionarVisibles.Enabled = canChangeSelection;
         btnDeseleccionarTodos.Enabled = _batchSelectedStableIds.Count > 0 && canChangeSelection;
         btnAplicarRecomendacionesSeleccionadas.Enabled = interactionAllowed;
         btnEnviarGruposPapelera.Enabled = interactionAllowed && _cleanupModeActive && _cleanupDriveService is not null;
         _recommendationToolTip.SetToolTip(btnEnviarGruposPapelera, GetBatchCleanupToolTip());
-        btnDeshacerUltimoLote.Enabled = _recommendationBatchUndoSession.HasSnapshot && _searchCancellationTokenSource is null &&
+        btnDeshacerUltimoLote.Enabled = IsLegacyActionsAllowed && _recommendationBatchUndoSession.HasSnapshot && _searchCancellationTokenSource is null &&
             !_cleanupOperationInProgress && !_batchOperationInProgress && !_scanResultsAreObsolete;
     }
 
@@ -1042,7 +1805,7 @@ public partial class Form1 : Form
 
     private bool CanApplyRecommendation(DuplicateGroupReview? review)
     {
-        if (review is null || review.Group.Files.Count < 2 || review.ReviewedWithoutCleanup ||
+        if (!IsLegacyActionsAllowed || review is null || review.Group.Files.Count < 2 || review.ReviewedWithoutCleanup ||
             _searchCancellationTokenSource is not null || _cleanupOperationInProgress || _batchOperationInProgress || _scanResultsAreObsolete)
         {
             return false;
@@ -1059,14 +1822,14 @@ public partial class Form1 : Form
     private void RefreshRecommendationActionAvailability()
     {
         bool interactionAllowed = _searchCancellationTokenSource is null && !_cleanupOperationInProgress && !_batchOperationInProgress;
-        btnAplicarRecomendacion.Enabled = interactionAllowed && CanApplyRecommendation(_selectedReview);
-        btnDeshacerRecomendacion.Enabled = interactionAllowed && _selectedReview is not null &&
+        btnAplicarRecomendacion.Enabled = IsLegacyActionsAllowed && interactionAllowed && CanApplyRecommendation(_selectedReview);
+        btnDeshacerRecomendacion.Enabled = IsLegacyActionsAllowed && interactionAllowed && _selectedReview is not null &&
             _recommendationUndoSession.HasSnapshot(_selectedReview.StableId);
     }
 
     private void dgvDuplicados_SelectionChanged(object? sender, EventArgs e)
     {
-        if (_isRefreshingReviewControls || dgvDuplicados.CurrentRow?.DataBoundItem is not ReviewGroupRow row)
+        if (!IsLegacyActionsAllowed || _isRefreshingReviewControls || dgvDuplicados.CurrentRow?.DataBoundItem is not ReviewGroupRow row)
         {
             return;
         }
@@ -1076,7 +1839,7 @@ public partial class Form1 : Form
 
     private void dgvGrupoDetalle_CellValueChanged(object? sender, DataGridViewCellEventArgs e)
     {
-        if (_isRefreshingReviewControls || e.RowIndex < 0 || e.ColumnIndex != colDecisionDetalle.Index ||
+        if (!IsLegacyActionsAllowed || _isRefreshingReviewControls || e.RowIndex < 0 || e.ColumnIndex != colDecisionDetalle.Index ||
             _selectedReview is null || dgvGrupoDetalle.Rows[e.RowIndex].DataBoundItem is not ReviewFileRow row)
         {
             return;
@@ -1104,7 +1867,7 @@ public partial class Form1 : Form
 
     private void dgvGrupoDetalle_CurrentCellDirtyStateChanged(object? sender, EventArgs e)
     {
-        if (dgvGrupoDetalle.IsCurrentCellDirty)
+        if (IsLegacyActionsAllowed && dgvGrupoDetalle.IsCurrentCellDirty)
         {
             dgvGrupoDetalle.CommitEdit(DataGridViewDataErrorContexts.Commit);
         }
@@ -1112,7 +1875,7 @@ public partial class Form1 : Form
 
     private void dgvGrupoDetalle_CellContentClick(object? sender, DataGridViewCellEventArgs e)
     {
-        if (e.RowIndex < 0 || e.ColumnIndex != colUbicacionDetalle.Index ||
+        if (!IsLegacyActionsAllowed || e.RowIndex < 0 || e.ColumnIndex != colUbicacionDetalle.Index ||
             dgvGrupoDetalle.Rows[e.RowIndex].DataBoundItem is not ReviewFileRow row)
         {
             return;
@@ -1152,7 +1915,7 @@ public partial class Form1 : Form
 
     private void txtNotas_Leave(object? sender, EventArgs e)
     {
-        if (_isRefreshingReviewControls || _selectedReview is null || string.Equals(_selectedReview.Notes ?? string.Empty, txtNotas.Text, StringComparison.Ordinal))
+        if (!IsLegacyActionsAllowed || _isRefreshingReviewControls || _selectedReview is null || string.Equals(_selectedReview.Notes ?? string.Empty, txtNotas.Text, StringComparison.Ordinal))
         {
             return;
         }
@@ -1165,6 +1928,7 @@ public partial class Form1 : Form
 
     private void btnMarcarRevisado_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         if (_selectedReview is null)
         {
             return;
@@ -1188,6 +1952,7 @@ public partial class Form1 : Form
 
     private async void btnAplicarRecomendacion_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         DuplicateGroupReview? review = _selectedReview;
         if (!CanApplyRecommendation(review) || review is null)
         {
@@ -1232,6 +1997,7 @@ public partial class Form1 : Form
 
     private async void btnDeshacerRecomendacion_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         if (_selectedReview is not DuplicateGroupReview review ||
             !_recommendationUndoSession.TryGet(review.StableId, out RecommendationApplicationSnapshot? snapshot) ||
             snapshot is null)
@@ -1258,6 +2024,7 @@ public partial class Form1 : Form
 
     private async void btnAplicarRecomendacionesSeleccionadas_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         if (_batchSelectedStableIds.Count == 0 || _batchOperationInProgress)
         {
             return;
@@ -1338,6 +2105,7 @@ public partial class Form1 : Form
 
     private async void btnDeshacerUltimoLote_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         if (_batchOperationInProgress || !_recommendationBatchUndoSession.TryGet(out RecommendationBatchUndoSnapshot? snapshot) || snapshot is null)
         {
             return;
@@ -1377,6 +2145,7 @@ public partial class Form1 : Form
 
     private async void btnEnviarGruposPapelera_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         string[] selectedStableIds = _batchSelectedStableIds.ToArray();
         if (selectedStableIds.Length == 0)
         {
@@ -1594,6 +2363,7 @@ public partial class Form1 : Form
 
     private async void btnGuardarRevision_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         bool forceOverwrite = false;
         if (_reviewStateIsCorrupt)
         {
@@ -1614,6 +2384,7 @@ public partial class Form1 : Form
 
     private void btnVerPlan_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         IReadOnlyList<CleanupPlanRow> plan = _reviewService.BuildCleanupPlan(_reviews);
         if (plan.Count == 0)
         {
@@ -1631,6 +2402,7 @@ public partial class Form1 : Form
 
     private async void btnExportarPlan_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         IReadOnlyList<CleanupPlanRow> plan = _reviewService.BuildCleanupPlan(_reviews);
         if (plan.Count == 0)
         {
@@ -1663,7 +2435,7 @@ public partial class Form1 : Form
 
     private async void btnActivarLimpieza_Click(object? sender, EventArgs e)
     {
-        if (_cleanupOperationInProgress || _cleanupModeActive)
+        if (!IsLegacyActionsAllowed || _cleanupOperationInProgress || _cleanupModeActive)
         {
             return;
         }
@@ -1719,6 +2491,7 @@ public partial class Form1 : Form
 
     private void btnDesactivarLimpieza_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         if (_cleanupOperationInProgress)
         {
             return;
@@ -1729,6 +2502,7 @@ public partial class Form1 : Form
 
     private void btnRestablecerAutorizacionLimpieza_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         if (_cleanupModeActive || _cleanupOperationInProgress)
         {
             MessageBox.Show(
@@ -1766,6 +2540,7 @@ public partial class Form1 : Form
 
     private async void btnEnviarGrupoPapelera_Click(object? sender, EventArgs e)
     {
+        if (!IsLegacyActionsAllowed) return;
         DuplicateGroupReview? review = GetCurrentSelectedReview();
         if (review is null || _cleanupDriveService is null || !_cleanupModeActive || _cleanupOperationInProgress)
         {
@@ -1958,6 +2733,33 @@ public partial class Form1 : Form
 
     private void RefreshCleanupEligibility()
     {
+        if (!IsLegacyActionsAllowed)
+        {
+            btnActivarLimpieza.Enabled = false;
+            btnDesactivarLimpieza.Enabled = false;
+            btnRestablecerAutorizacionLimpieza.Enabled = false;
+            btnEnviarGrupoPapelera.Enabled = false;
+            btnEnviarGruposPapelera.Enabled = false;
+            btnAplicarRecomendacion.Enabled = false;
+            btnDeshacerRecomendacion.Enabled = false;
+            btnAplicarRecomendacionesSeleccionadas.Enabled = false;
+            btnDeshacerUltimoLote.Enabled = false;
+            btnMarcarRevisado.Enabled = false;
+            btnGuardarRevision.Enabled = false;
+            btnVerPlan.Enabled = false;
+            btnExportarPlan.Enabled = false;
+            btnAbrirPapelera.Enabled = false;
+            txtNotas.ReadOnly = true;
+            dgvGrupoDetalle.ReadOnly = true;
+            lblModoLimpieza.Text = "REVISIÓN PAGINADA: decisiones locales de conservación habilitadas; recomendaciones y limpieza deshabilitadas.";
+            lblModoLimpieza.BackColor = Color.LemonChiffon;
+            lblModoLimpieza.ForeColor = Color.DarkRed;
+            lblElegibilidadLimpieza.Text = "La ruta paginada no permite operaciones de limpieza.";
+            lblElegibilidadLimpieza.ForeColor = Color.DarkRed;
+            RefreshBatchSelectionUi();
+            return;
+        }
+
         CleanupEligibilityResult eligibility = GetCleanupEligibility();
 
         btnActivarLimpieza.Enabled = !_cleanupOperationInProgress && !_cleanupModeActive;
@@ -2135,7 +2937,7 @@ public partial class Form1 : Form
 
     private void NavigateGroups(int direction, DuplicateGroupReviewStatus? targetStatus)
     {
-        if (_filteredReviews.Count == 0)
+        if (!IsLegacyActionsAllowed || _filteredReviews.Count == 0)
         {
             return;
         }
@@ -2168,7 +2970,7 @@ public partial class Form1 : Form
 
     private async Task<bool> SaveReviewStateAsync(bool forceOverwriteCorruptState, bool showError)
     {
-        if (_reviews.Count == 0 || (_reviewStateIsCorrupt && !forceOverwriteCorruptState))
+        if (!IsLegacyActionsAllowed || _reviews.Count == 0 || (_reviewStateIsCorrupt && !forceOverwriteCorruptState))
         {
             return false;
         }
@@ -2230,11 +3032,14 @@ public partial class Form1 : Form
     private async void reviewSaveTimer_Tick(object? sender, EventArgs e)
     {
         _reviewSaveTimer.Stop();
+        if (!IsLegacyActionsAllowed) return;
         await SaveReviewStateAsync(forceOverwriteCorruptState: false, showError: false);
     }
 
     private async void Form1_FormClosing(object? sender, FormClosingEventArgs e)
     {
+        CancelPagedQueries();
+        if (!IsLegacyActionsAllowed) return;
         if (_closeAfterSave || !_reviewChangesPending || _reviewStateIsCorrupt)
         {
             return;
@@ -2248,6 +3053,7 @@ public partial class Form1 : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        CancelPagedQueries();
         _searchCancellationTokenSource?.Cancel();
         _searchCancellationTokenSource?.Dispose();
         _cleanupCancellationTokenSource?.Cancel();
@@ -2257,6 +3063,7 @@ public partial class Form1 : Form
         _reviewSaveTimer.Stop();
         _reviewSaveTimer.Dispose();
         _reviewSaveSemaphore.Dispose();
+        if (_demoDataDirectory is not null) DemoReviewData.TryDelete(_demoDataDirectory);
         base.OnFormClosed(e);
     }
 
@@ -2280,7 +3087,7 @@ public partial class Form1 : Form
         string scanSummary = scanResult is null
             ? string.Empty
             : $"Elementos examinados: {scanResult.ItemsExamined:N0}{Environment.NewLine}" +
-              $"Archivos comparables: {scanResult.ComparableFiles.Count:N0}{Environment.NewLine}" +
+              $"Archivos comparables: {scanResult.ComparableFilesCount:N0}{Environment.NewLine}" +
               $"Archivos sin MD5 ignorados: {scanResult.FilesWithoutMd5Ignored:N0}{Environment.NewLine}";
 
         return scanSummary +
@@ -2342,4 +3149,33 @@ public partial class Form1 : Form
     private sealed record DecisionOption(DuplicateFileDecision Value, string DisplayName);
 
     private sealed record ReviewStatusFilterOption(string DisplayName, DuplicateGroupReviewStatus? Status);
+
+    private bool IsLegacyActionsAllowed => PagedReadOnlyViewSafety.LegacyActionsEnabled(_pagedReadOnlyMode, demoMode: _demoMode);
+
+    private sealed record PagedGroupDisplayRow(
+        DuplicateGroupIdentity Identity,
+        string RepresentativeName,
+        string MemberCountText,
+        string SizeText,
+        string RecoverableText,
+        string Checksum);
+
+    private sealed class PagedMemberDisplayRow(
+        string fileId,
+        string name,
+        string path,
+        string sizeText,
+        string modifiedText,
+        string? parentFolderUrl,
+        DuplicateFileDecision decision)
+    {
+        public string FileId { get; } = fileId;
+        public string Name { get; } = name;
+        public string Path { get; } = path;
+        public string SizeText { get; } = sizeText;
+        public string ModifiedText { get; } = modifiedText;
+        public string? ParentFolderUrl { get; } = parentFolderUrl;
+        public DuplicateFileDecision Decision { get; set; } = decision;
+        public string LocationText => string.IsNullOrWhiteSpace(ParentFolderUrl) ? string.Empty : "Abrir ubicación";
+    }
 }
