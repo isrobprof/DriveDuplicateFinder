@@ -7,7 +7,10 @@ using DriveDuplicateFinder.Models;
 using DriveDuplicateFinder.Models.Persistence;
 using DriveDuplicateFinder.Services;
 using DriveDuplicateFinder.Utilities;
+using Google;
 using Google.Apis.Drive.v3;
+using System.Net;
+using System.Net.Http;
 
 namespace DriveDuplicateFinder;
 
@@ -18,6 +21,8 @@ public partial class Form1 : Form
     private readonly string? _demoDataDirectory;
     private DemoReviewSeed? _demoSeed;
     private readonly RecoverableFullScanService _recoverableFullScanService;
+    private readonly PersistedCleanupGroupReviewAdapter _pagedPreflightAdapter;
+    private readonly PagedGroupPreflightService _pagedGroupPreflightService;
     private readonly ReviewStateRepository _reviewStateRepository;
     private readonly DuplicateFinderService _duplicateFinderService = new();
     private readonly DuplicateReviewService _reviewService = new();
@@ -71,6 +76,8 @@ public partial class Form1 : Form
     private long _pagedCurrentMemberCount;
     private bool _isBindingPagedMembers;
     private bool _pagedReviewWriteInProgress;
+    private bool _pagedPreflightInProgress;
+    private bool _pagedGroupReviewConfirmed;
 
     private readonly GroupBox grpFiltros = new();
     private readonly ComboBox cmbFiltroEstado = new();
@@ -128,6 +135,7 @@ public partial class Form1 : Form
     private readonly Button btnPagedConfirmGroup = new();
     private readonly Button btnPagedSkipGroup = new();
     private readonly Button btnPagedViewCleanupPlan = new();
+    private readonly Button btnPagedCheckDrive = new();
     private readonly Button btnReopenLatestScan = new();
     private const int PagedGroupPageSize = 1;
     private const int PagedMemberPageSize = 100;
@@ -140,7 +148,11 @@ public partial class Form1 : Form
         _demoMode = demoMode;
         _demoDataDirectory = demoMode ? DemoReviewData.CreateTemporaryDirectoryPath() : null;
         _recoverableFullScanService = new RecoverableFullScanService(_fileService, _demoDataDirectory);
-        _reviewStateRepository = new ReviewStateRepository(new SqliteConnectionFactory(new LocalDataPathService(_demoDataDirectory)));
+        var connectionFactory = new SqliteConnectionFactory(new LocalDataPathService(_demoDataDirectory));
+        _reviewStateRepository = new ReviewStateRepository(connectionFactory);
+        _pagedPreflightAdapter = new PersistedCleanupGroupReviewAdapter(connectionFactory, _fileService);
+        _pagedGroupPreflightService = new PagedGroupPreflightService(
+            _recoverableFullScanService, _pagedPreflightAdapter, _trashService);
         _recommendationBatchService = new RecommendationBatchService(_recommendationApplicationService, _reviewService);
         _cleanupBatchService = new CleanupBatchService(_trashService);
         InitializeComponent();
@@ -166,7 +178,7 @@ public partial class Form1 : Form
 
     private async void btnConectar_Click(object? sender, EventArgs e)
     {
-        if (_demoMode) return;
+        if (_demoMode || _pagedPreflightInProgress) return;
         btnConectar.Enabled = false;
         btnBuscar.Enabled = false;
         btnReopenLatestScan.Enabled = false;
@@ -219,7 +231,7 @@ public partial class Form1 : Form
 
     private async void btnBuscar_Click(object? sender, EventArgs e)
     {
-        if (_demoMode) return;
+        if (_demoMode || _pagedPreflightInProgress) return;
         if (_driveService is null)
         {
             lblEstado.Text = "Con\u00E9ctese con Google Drive antes de buscar duplicados.";
@@ -393,7 +405,7 @@ public partial class Form1 : Form
 
     private async void btnReopenLatestScan_Click(object? sender, EventArgs e)
     {
-        if (_demoMode) return;
+        if (_demoMode || _pagedPreflightInProgress) return;
         if (_driveService is null) return;
         btnReopenLatestScan.Enabled = false;
         btnBuscar.Enabled = false;
@@ -440,6 +452,7 @@ public partial class Form1 : Form
         _pagedCandidateCount = 0;
         _pagedUndecidedCount = 0;
         _pagedCurrentMemberCount = 0;
+        _pagedGroupReviewConfirmed = false;
         _pagedReadOnlyMode = true;
         _scanResultsAreObsolete = false;
         _reviewChangesPending = false;
@@ -738,15 +751,16 @@ public partial class Form1 : Form
         ConfigureButton(btnPagedConfirmGroup, "Confirmar revisión", btnPagedConfirmGroup_Click);
         ConfigureButton(btnPagedSkipGroup, "Saltar grupo", btnPagedSkipGroup_Click);
         ConfigureButton(btnPagedViewCleanupPlan, "Ver plan de limpieza", btnPagedViewCleanupPlan_Click);
+        ConfigureButton(btnPagedCheckDrive, "Comprobar en Google Drive", btnPagedCheckDrive_Click);
         lblPagedMembersPage.AutoSize = true;
         lblPagedMembersPage.Padding = new Padding(4, 6, 0, 0);
-        memberNavigation.Controls.AddRange([btnPagedPreviousMemberPage, btnPagedNextMemberPage, btnPagedConfirmGroup, btnPagedSkipGroup, btnPagedViewCleanupPlan, lblPagedMembersPage]);
+        memberNavigation.Controls.AddRange([btnPagedPreviousMemberPage, btnPagedNextMemberPage, btnPagedConfirmGroup, btnPagedSkipGroup, btnPagedViewCleanupPlan, btnPagedCheckDrive, lblPagedMembersPage]);
         var reviewNotice = new Label
         {
             AutoSize = true,
             Dock = DockStyle.Fill,
             ForeColor = Color.DarkSlateBlue,
-            Text = "Solo las decisiones explícitas se guardan. Los miembros ocultos o sin decidir quedan fuera del plan; la vista previa no consulta ni modifica Google Drive."
+            Text = "Los miembros sin decidir quedan fuera de los candidatos. La vista previa es local; 'Comprobar en Google Drive' solo lee metadatos y nunca ejecuta limpieza."
         };
         memberLayout.Controls.Add(reviewNotice, 0, 0);
         memberLayout.Controls.Add(dgvPagedMembers, 0, 1);
@@ -924,6 +938,7 @@ public partial class Form1 : Form
         PagedRequestLease request = _pagedRequestGeneration.Begin();
         btnCancelar.Enabled = true;
         _activePagedGroup = identity;
+        _pagedGroupReviewConfirmed = false;
         _pagedMemberOffset = offset;
         _pagedKeepCount = 0;
         _pagedCandidateCount = 0;
@@ -985,6 +1000,7 @@ public partial class Form1 : Form
             PersistedFileDecisionPage decisions = await _reviewStateRepository.GetDecisionsPageAsync(identity, offset, PagedMemberPageSize, request.Token);
             ReviewDecisionCounts counts = await _reviewStateRepository.GetGroupDecisionCountsAsync(identity, request.Token);
             if (!_pagedRequestGeneration.IsCurrent(request)) return;
+            _pagedGroupReviewConfirmed = groupState.IsReviewConfirmed && !groupState.ReviewedWithoutCleanup;
             var decisionsByFileId = decisions.Items.ToDictionary(item => item.FileId, item => item.Decision, StringComparer.Ordinal);
             foreach (DataGridViewRow gridRow in dgvPagedMembers.Rows)
             {
@@ -1036,17 +1052,22 @@ public partial class Form1 : Form
         string range = groupCount == 0 ? "No hay grupos" : $"Grupo {groupNumber:N0} de {groupTotal:N0}";
         bool groupPageLoaded = _pagedGroupPage is not null;
         lblPagedGroupPage.Text = _pagedReadOnlyMode ? range : string.Empty;
-        btnPagedPreviousGroupPage.Enabled = _pagedReadOnlyMode && groupPageLoaded && PagedReadOnlyViewSafety.HasPreviousPage(_pagedGroupOffset);
-        btnPagedNextGroupPage.Enabled = _pagedReadOnlyMode && groupPageLoaded &&
+        bool pagedBusy = _pagedReviewWriteInProgress || _pagedPreflightInProgress;
+        btnPagedPreviousGroupPage.Enabled = _pagedReadOnlyMode && !pagedBusy && groupPageLoaded && PagedReadOnlyViewSafety.HasPreviousPage(_pagedGroupOffset);
+        btnPagedNextGroupPage.Enabled = _pagedReadOnlyMode && !pagedBusy && groupPageLoaded &&
             PagedReadOnlyViewSafety.HasNextPage(_pagedGroupOffset, groupCount, groupTotal);
         bool hasMembers = _activePagedGroup is not null;
-        btnPagedPreviousMemberPage.Enabled = _pagedReadOnlyMode && hasMembers && _pagedMemberOffset > 0;
-        btnPagedNextMemberPage.Enabled = _pagedReadOnlyMode && hasMembers &&
+        dgvPagedGroups.Enabled = _pagedReadOnlyMode && !_pagedPreflightInProgress;
+        btnPagedPreviousMemberPage.Enabled = _pagedReadOnlyMode && !pagedBusy && hasMembers && _pagedMemberOffset > 0;
+        btnPagedNextMemberPage.Enabled = _pagedReadOnlyMode && !pagedBusy && hasMembers &&
             (long)_pagedMemberOffset + (dgvPagedMembers.Rows.Count) < _pagedCurrentMemberCount;
-        btnPagedConfirmGroup.Enabled = _pagedReadOnlyMode && hasMembers && !_pagedReviewWriteInProgress && _pagedKeepCount > 0 && _pagedCandidateCount > 0;
-        btnPagedSkipGroup.Enabled = _pagedReadOnlyMode && hasMembers && !_pagedReviewWriteInProgress;
-        btnPagedViewCleanupPlan.Enabled = _pagedReadOnlyMode && _pagedInventory is not null && !_pagedReviewWriteInProgress;
-        dgvPagedMembers.Enabled = _pagedReadOnlyMode && hasMembers && !_pagedReviewWriteInProgress;
+        btnPagedConfirmGroup.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy && _pagedKeepCount > 0 && _pagedCandidateCount > 0;
+        btnPagedSkipGroup.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy;
+        btnPagedViewCleanupPlan.Enabled = _pagedReadOnlyMode && _pagedInventory is not null && !pagedBusy;
+        btnPagedCheckDrive.Enabled = _pagedReadOnlyMode && !_demoMode && _driveService is not null &&
+            _pagedInventory is not null && hasMembers && _pagedGroupReviewConfirmed &&
+            _pagedKeepCount > 0 && _pagedCandidateCount > 0 && !pagedBusy;
+        dgvPagedMembers.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy;
     }
 
     private void CancelPagedQueries() => _pagedRequestGeneration.CancelCurrent();
@@ -1170,6 +1191,98 @@ public partial class Form1 : Form
         using var preview = new PagedCleanupPlanPreviewForm(_recoverableFullScanService, _pagedInventory);
         preview.ShowDialog(this);
     }
+
+    private async void btnPagedCheckDrive_Click(object? sender, EventArgs e)
+    {
+        if (_demoMode || !_pagedReadOnlyMode || _pagedPreflightInProgress || _pagedReviewWriteInProgress ||
+            _driveService is null || _pagedInventory is null || _activePagedGroup is not DuplicateGroupIdentity identity ||
+            identity.Inventory != _pagedInventory || !_pagedGroupReviewConfirmed ||
+            _pagedKeepCount < 1 || _pagedCandidateCount < 1)
+            return;
+
+        PagedRequestLease request = _pagedRequestGeneration.Begin();
+        _pagedPreflightInProgress = true;
+        btnConectar.Enabled = false;
+        btnBuscar.Enabled = false;
+        btnReopenLatestScan.Enabled = false;
+        btnCancelar.Enabled = true;
+        lblEstado.Text = "Comprobando la cuenta y el inventario antes de consultar metadatos remotos; no se ejecutará limpieza...";
+        UpdatePagedNavigationUi();
+        try
+        {
+            // Uses the existing read-only OAuth client, already scoped to DriveMetadataReadonly.
+            var progress = new Progress<string>(message =>
+            {
+                if (IsCurrentPagedPreflight(request, identity)) lblEstado.Text = message + " No se modificarán archivos.";
+            });
+            PagedGroupPreflightResult check = await _pagedGroupPreflightService.CheckOneGroupAsync(
+                _driveService, identity, progress, request.Token);
+            PersistedCleanupGroupReview localReview = check.LocalReview;
+            CleanupPreflightResult preflight = check.Preflight;
+            if (!IsCurrentPagedPreflight(request, identity)) return;
+            if (check.IsStale)
+            {
+                lblEstado.Text = "Resultado descartado: el grupo, inventario, decisiones o confirmación dejaron de ser vigentes.";
+                return;
+            }
+
+            if (request.Token.IsCancellationRequested)
+            {
+                if (!IsDisposed && !Disposing) lblEstado.Text = "Comprobación cancelada; no se ejecutó limpieza.";
+                return;
+            }
+
+            using var resultForm = new PagedGroupPreflightResultForm(localReview, preflight, check.RemoteFileReadsStarted);
+            resultForm.ShowDialog(this);
+            lblEstado.Text = preflight.IsSuccessful
+                ? "Preflight de solo lectura completado. Ningún archivo se modificó."
+                : "Preflight no aprobado; no se ejecutó limpieza. Consulta los bloqueos y motivos.";
+        }
+        catch (OperationCanceledException) when (request.Token.IsCancellationRequested)
+        {
+            if (!IsDisposed && !Disposing) lblEstado.Text = "Comprobación cancelada; no se ejecutó limpieza.";
+        }
+        catch (Exception exception)
+        {
+            if (IsCurrentPagedPreflight(request, identity))
+            {
+                lblEstado.Text = "No se pudo comprobar el grupo; no se ejecutó limpieza.";
+                MessageBox.Show(
+                    DescribeReadOnlyPreflightFailure(exception),
+                    "Preflight de solo lectura",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+        }
+        finally
+        {
+            _pagedPreflightInProgress = false;
+            _pagedRequestGeneration.Complete(request);
+            if (!IsDisposed && !Disposing)
+            {
+                btnConectar.Enabled = !_demoMode;
+                btnBuscar.Enabled = !_demoMode && _driveService is not null;
+                btnReopenLatestScan.Enabled = !_demoMode && _driveService is not null;
+                btnCancelar.Enabled = _searchCancellationTokenSource is not null || _pagedRequestGeneration.HasActiveRequest;
+                UpdatePagedNavigationUi();
+            }
+        }
+    }
+
+    private bool IsCurrentPagedPreflight(PagedRequestLease request, DuplicateGroupIdentity identity) =>
+        !_demoMode && _pagedRequestGeneration.IsCurrent(request) && _pagedReadOnlyMode &&
+        _pagedInventory == identity.Inventory && _activePagedGroup == identity;
+
+    private static string DescribeReadOnlyPreflightFailure(Exception exception) => exception switch
+    {
+        GoogleApiException apiException when apiException.HttpStatusCode == HttpStatusCode.Unauthorized =>
+            "Google Drive requiere renovar o restablecer la autorización de solo lectura. No se modificó Google Drive.",
+        GoogleApiException apiException when apiException.HttpStatusCode == HttpStatusCode.Forbidden =>
+            "Google Drive denegó la lectura de metadatos. Comprueba la cuenta y el permiso de lectura; no se modificó Google Drive.",
+        HttpRequestException => "No se pudo conectar con Google Drive. Comprueba la red y vuelve a intentarlo; no se modificó Google Drive.",
+        InvalidOperationException => exception.Message,
+        _ => "Falló la comprobación de solo lectura. No se modificó Google Drive. Detalle: " + exception.GetType().Name
+    };
 
     private async void btnPagedPreviousGroupPage_Click(object? sender, EventArgs e) =>
         await LoadPagedGroupPageAsync(Math.Max(0, _pagedGroupOffset - PagedGroupPageSize));

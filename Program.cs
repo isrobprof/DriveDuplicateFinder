@@ -36,6 +36,8 @@ static class Program
             Infrastructure = await Data.Sqlite.SqliteInfrastructureLocalChecks.VerifyAsync(),
             RecoverableFullScan = await Data.Sqlite.RecoverableFullScanLocalChecks.VerifyAsync(),
             ReviewStatePersistence = await Data.Sqlite.ReviewStatePersistenceLocalChecks.VerifyAsync(),
+            PersistedCleanupGroupReviewAdapter = await Data.Sqlite.PersistedCleanupGroupReviewAdapterLocalChecks.VerifyAsync(),
+            GoogleDriveTrashPreflight = await Services.GoogleDriveTrashPreflightLocalChecks.VerifyAsync(),
             PagedReadOnlyView = Services.PagedReadOnlyViewLocalChecks.Verify(),
             DemoReviewIsolation = await Services.DemoReviewData.VerifyIsolationAsync()
         };

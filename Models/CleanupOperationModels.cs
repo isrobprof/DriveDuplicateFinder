@@ -82,11 +82,24 @@ public sealed class CleanupPreflightResult
 
     public bool WasCancelled { get; set; }
 
+    public CleanupPreflightFailureKind FailureKind { get; set; }
+
     public List<string> ValidationMessages { get; } = [];
 
     public CleanupFileSnapshot? KeepFile { get; set; }
 
     public List<CleanupFileSnapshot> CandidateFiles { get; } = [];
+}
+
+public enum CleanupPreflightFailureKind
+{
+    None,
+    Cancelled,
+    AuthenticationRequired,
+    PermissionDenied,
+    FileUnavailable,
+    NetworkUnavailable,
+    RemoteFailure
 }
 
 public sealed class CleanupFileResult

@@ -3,6 +3,8 @@ using Google;
 using Google.Apis.Drive.v3;
 using GoogleFile = Google.Apis.Drive.v3.Data.File;
 using System.Text.RegularExpressions;
+using System.Net;
+using System.Net.Http;
 
 namespace DriveDuplicateFinder.Services;
 
@@ -198,15 +200,51 @@ public sealed class GoogleDriveTrashService
                 result.ValidationMessages.AddRange(ValidateCandidateSnapshot(candidate, review.Group, candidateSnapshot));
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             result.WasCancelled = true;
+            result.FailureKind = CleanupPreflightFailureKind.Cancelled;
             result.ValidationMessages.Add("El preflight fue cancelado antes de modificar Google Drive.");
+            return result;
+        }
+        catch (GoogleApiException exception)
+        {
+            result.FailureKind = exception.HttpStatusCode switch
+            {
+                HttpStatusCode.Unauthorized => CleanupPreflightFailureKind.AuthenticationRequired,
+                HttpStatusCode.Forbidden => CleanupPreflightFailureKind.PermissionDenied,
+                HttpStatusCode.NotFound => CleanupPreflightFailureKind.FileUnavailable,
+                HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests or
+                    HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout =>
+                    CleanupPreflightFailureKind.NetworkUnavailable,
+                _ => CleanupPreflightFailureKind.RemoteFailure
+            };
+            result.ValidationMessages.Add(result.FailureKind switch
+            {
+                CleanupPreflightFailureKind.AuthenticationRequired => "Google Drive requiere renovar o restablecer la autorización de lectura.",
+                CleanupPreflightFailureKind.PermissionDenied => "Google Drive denegó la lectura de metadatos de uno de los archivos.",
+                CleanupPreflightFailureKind.FileUnavailable => "Un archivo no existe o ya no es accesible para esta cuenta.",
+                CleanupPreflightFailureKind.NetworkUnavailable => "Google Drive no está disponible temporalmente; no se completó el preflight.",
+                _ => "Google Drive rechazó una lectura del preflight; no se completó la comprobación."
+            });
+            return result;
+        }
+        catch (HttpRequestException)
+        {
+            result.FailureKind = CleanupPreflightFailureKind.NetworkUnavailable;
+            result.ValidationMessages.Add("No se pudo conectar con Google Drive; no se completó el preflight.");
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            result.FailureKind = CleanupPreflightFailureKind.NetworkUnavailable;
+            result.ValidationMessages.Add("La conexión con Google Drive agotó el tiempo de espera; no se completó el preflight.");
             return result;
         }
         catch (Exception)
         {
-            result.ValidationMessages.Add("No se pudo completar la verificación previa. Repite la búsqueda y vuelve a intentarlo.");
+            result.FailureKind = CleanupPreflightFailureKind.RemoteFailure;
+            result.ValidationMessages.Add("No se pudo completar la verificación previa. Repite la comprobación.");
             return result;
         }
 
