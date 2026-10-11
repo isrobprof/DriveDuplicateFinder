@@ -7,10 +7,14 @@ public sealed class CleanupHistoryService
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    public string HistoryDirectory => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "DriveDuplicateFinder",
-        "cleanup-history");
+    private readonly string? _historyDirectoryOverride;
+
+    public CleanupHistoryService(string? historyDirectory = null) => _historyDirectoryOverride = historyDirectory;
+
+    public string HistoryDirectory => _historyDirectoryOverride ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DriveDuplicateFinder",
+            "cleanup-history");
 
     public async Task<CleanupHistoryHandle> CreatePendingAsync(
         DuplicateGroupReview review,
@@ -32,7 +36,9 @@ public sealed class CleanupHistoryService
             if (review.DecisionsByFileId.TryGetValue(file.Id, out DuplicateFileDecision decision) &&
                 decision == DuplicateFileDecision.Keep)
             {
-                record.KeepFile = CreateSnapshot(file);
+                CleanupFileSnapshot keepSnapshot = CreateSnapshot(file);
+                record.KeepFiles.Add(keepSnapshot);
+                record.KeepFile ??= keepSnapshot;
             }
             else if (review.DecisionsByFileId.TryGetValue(file.Id, out decision) &&
                      decision == DuplicateFileDecision.CandidateForTrash)

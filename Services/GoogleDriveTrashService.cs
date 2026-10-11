@@ -252,6 +252,109 @@ public sealed class GoogleDriveTrashService
         return result;
     }
 
+    /// <summary>
+    /// Read-only preflight for a persisted paged group. Unlike the legacy whole-group
+    /// contract, it permits multiple Keeps and Undecided members, but it reads every
+    /// explicit Keep and only explicit candidates. Undecided members are never considered.
+    /// </summary>
+    public async Task<CleanupPreflightResult> PreflightPersistedPlanAsync(
+        DriveService cleanupDriveService,
+        DuplicateGroupReview review,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(cleanupDriveService);
+        ArgumentNullException.ThrowIfNull(review);
+        var result = new CleanupPreflightResult { Review = review };
+        DriveFileInfo[] members = review.Group.Files.ToArray();
+        if (review.Status != DuplicateGroupReviewStatus.ReadyForCleanup || members.Length < 2 ||
+            members.Select(file => file.Id).Distinct(StringComparer.Ordinal).Count() != members.Length ||
+            review.DecisionsByFileId.Count != members.Length ||
+            members.Any(file => !review.DecisionsByFileId.ContainsKey(file.Id)))
+        {
+            result.ValidationMessages.Add("La revisión persistida no cubre exactamente los miembros del grupo confirmado.");
+            return result;
+        }
+
+        DriveFileInfo[] keeps = members.Where(file => review.DecisionsByFileId[file.Id] == DuplicateFileDecision.Keep)
+            .OrderBy(file => file.Id, StringComparer.Ordinal).ToArray();
+        DriveFileInfo[] candidates = members.Where(file => review.DecisionsByFileId[file.Id] == DuplicateFileDecision.CandidateForTrash)
+            .OrderBy(file => file.Id, StringComparer.Ordinal).ToArray();
+        if (keeps.Length == 0 || candidates.Length == 0 || candidates.Length > MaximumCandidateCount)
+        {
+            result.ValidationMessages.Add($"El grupo requiere al menos un Keep y entre 1 y {MaximumCandidateCount} candidatos explícitos.");
+            return result;
+        }
+
+        foreach (DriveFileInfo candidate in candidates)
+            ValidateFileForLocalPlan(candidate, review.Group, result.ValidationMessages);
+        if (result.ValidationMessages.Count > 0) return result;
+
+        try
+        {
+            foreach (DriveFileInfo keep in keeps)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                CleanupFileSnapshot snapshot = await GetCurrentSnapshotAsync(cleanupDriveService, keep, cancellationToken);
+                result.KeepFiles.Add(snapshot);
+                result.ValidationMessages.AddRange(ValidateKeepSnapshot(keep, review.Group, snapshot));
+            }
+
+            result.KeepFile = result.KeepFiles[0];
+            foreach (DriveFileInfo candidate in candidates)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                CleanupFileSnapshot snapshot = await GetCurrentSnapshotAsync(cleanupDriveService, candidate, cancellationToken);
+                result.CandidateFiles.Add(snapshot);
+                result.ValidationMessages.AddRange(ValidateCandidateSnapshot(candidate, review.Group, snapshot));
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            result.WasCancelled = true;
+            result.FailureKind = CleanupPreflightFailureKind.Cancelled;
+            result.ValidationMessages.Add("El preflight fue cancelado antes de modificar Google Drive.");
+            return result;
+        }
+        catch (GoogleApiException exception)
+        {
+            result.FailureKind = ClassifyPreflightFailure(exception.HttpStatusCode);
+            result.ValidationMessages.Add("Google Drive no permitió completar la lectura del preflight.");
+            return result;
+        }
+        catch (HttpRequestException)
+        {
+            result.FailureKind = CleanupPreflightFailureKind.NetworkUnavailable;
+            result.ValidationMessages.Add("No se pudo conectar con Google Drive; no se completó el preflight.");
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            result.FailureKind = CleanupPreflightFailureKind.NetworkUnavailable;
+            result.ValidationMessages.Add("La conexión con Google Drive agotó el tiempo de espera.");
+            return result;
+        }
+        catch (Exception)
+        {
+            result.FailureKind = CleanupPreflightFailureKind.RemoteFailure;
+            result.ValidationMessages.Add("No se pudo completar la verificación previa.");
+            return result;
+        }
+
+        result.IsSuccessful = result.ValidationMessages.Count == 0 && result.KeepFiles.Count == keeps.Length &&
+            result.CandidateFiles.Count == candidates.Length;
+        return result;
+    }
+
+    private static CleanupPreflightFailureKind ClassifyPreflightFailure(HttpStatusCode statusCode) => statusCode switch
+    {
+        HttpStatusCode.Unauthorized => CleanupPreflightFailureKind.AuthenticationRequired,
+        HttpStatusCode.Forbidden => CleanupPreflightFailureKind.PermissionDenied,
+        HttpStatusCode.NotFound => CleanupPreflightFailureKind.FileUnavailable,
+        HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway or
+            HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout => CleanupPreflightFailureKind.NetworkUnavailable,
+        _ => CleanupPreflightFailureKind.RemoteFailure
+    };
+
     public async Task<CleanupOperationResult> ExecuteAsync(
         DriveService cleanupDriveService,
         CleanupPreflightResult preflight,
@@ -277,6 +380,11 @@ public sealed class GoogleDriveTrashService
         }
 
         record.KeepFile = preflight.KeepFile;
+        record.KeepFiles.Clear();
+        IEnumerable<CleanupFileSnapshot> keepSnapshots = preflight.KeepFiles;
+        if (preflight.KeepFiles.Count == 0 && preflight.KeepFile is not null)
+            keepSnapshots = [preflight.KeepFile];
+        record.KeepFiles.AddRange(keepSnapshots);
         record.CandidateFiles.Clear();
         record.CandidateFiles.AddRange(preflight.CandidateFiles);
         record.Validations.Clear();
@@ -478,6 +586,8 @@ public sealed class GoogleDriveTrashService
         fileResult.Status = CleanupFileStatus.Failed;
         if (isTrashed is null)
         {
+            fileResult.FailureStage = "Files.UpdateOutcomeUncertain";
+            fileResult.FailureReason = "OutcomeUncertain";
             fileResult.Message = $"{fileResult.Message} No se pudo verificar si el archivo cambió; revisa manualmente la papelera.";
             await FinalizeAfterFailureAsync(record, historyService, history, CancellationToken.None);
             return new CleanupOperationResult

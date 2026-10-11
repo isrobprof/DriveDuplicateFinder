@@ -25,6 +25,9 @@ public sealed record GoogleDriveTrashPreflightCheckResult(
     bool CancellationHandledWithoutWrites,
     bool AccountMismatchRejectedBeforeGroupReads,
     bool DecisionChangeDuringPreflightDiscarded,
+    bool PersistedCleanupPlanPreparedReadOnly,
+    bool MultipleKeepsCheckedAndUndecidedExcluded,
+    bool SimulatedExecutionAttemptNotRetried,
     bool NoWriteRequestsSent,
     bool TemporaryDirectoryDeleted);
 
@@ -106,6 +109,9 @@ public static class GoogleDriveTrashPreflightLocalChecks
         bool stalePreflightUnapproved = false;
         bool staleFailureClassified = false;
         bool staleRequestsWereGetOnly = false;
+        bool persistedCleanupPlanPreparedReadOnly = false;
+        bool multipleKeepsCheckedAndUndecidedExcluded = false;
+        bool simulatedExecutionAttemptNotRetried = false;
         string staleRequestSummary = string.Empty;
         bool temporaryDirectoryDeleted = false;
         try
@@ -126,6 +132,58 @@ public static class GoogleDriveTrashPreflightLocalChecks
             var scanService = new RecoverableFullScanService(mapper, root);
             var adapter = new PersistedCleanupGroupReviewAdapter(factory, mapper);
             var coordinator = new PagedGroupPreflightService(scanService, adapter, new GoogleDriveTrashService());
+
+            var persistedPlanTransport = new LocalDriveTransport(Email, ResponseScenario.Valid);
+            using (DriveService readOnlyDrive = persistedPlanTransport.CreateDriveService())
+            {
+                PagedGroupPreflightResult prior = await coordinator.CheckOneGroupAsync(readOnlyDrive, identity, cancellationToken: cancellationToken);
+                var cleanupTransport = new LocalDriveTransport(Email, ResponseScenario.Valid);
+                using var cleanupSession = new CleanupDriveSession(cleanupTransport.CreateDriveService());
+                var cleanupCoordinator = new PagedGroupCleanupService(scanService, adapter, reviewRepository,
+                    new GoogleDriveTrashService(), new CleanupHistoryService(Path.Combine(root, "history")));
+                PagedGroupCleanupPlan plan = await cleanupCoordinator.PreparePlanAsync(cleanupSession, prior, cancellationToken: cancellationToken);
+                PagedGroupCleanupConfirmation confirmation = cleanupCoordinator.ConfirmPlan(
+                    plan, plan.KeepFiles.Select(file => file.Id), plan.CandidateFiles.Select(file => file.Id));
+                bool mismatchRejected = false;
+                try { _ = cleanupCoordinator.ConfirmPlan(plan, plan.KeepFiles.Select(file => file.Id), Array.Empty<string>()); }
+                catch (InvalidOperationException) { mismatchRejected = true; }
+                persistedCleanupPlanPreparedReadOnly = prior.Preflight.IsSuccessful && plan.CandidateFiles.Count == 1 &&
+                    plan.CandidateFiles[0].Id == "candidate-file" && plan.KeepFiles.Count == 1 &&
+                    confirmation is not null && mismatchRejected &&
+                    persistedPlanTransport.Requests.All(request => request.Method == HttpMethod.Get) &&
+                    cleanupTransport.Requests.All(request => request.Method == HttpMethod.Get);
+            }
+
+            var multiKeepTransport = new LocalDriveTransport(Email, ResponseScenario.Valid);
+            using (DriveService drive = multiKeepTransport.CreateDriveService())
+            {
+                DuplicateGroupReview baseReview = CreateReview(includeUndecided: false);
+                DriveFileInfo secondKeep = CreateFile("keep-file-2", "keep-2.pdf");
+                DriveFileInfo pending = CreateFile("pending-file", "pending.pdf");
+                var multipleKeepReview = new DuplicateGroupReview
+                {
+                    StableId = baseReview.StableId,
+                    Group = new DuplicateGroup
+                    {
+                        GroupNumber = 2, FileSize = Size, Md5Checksum = Hash,
+                        Files = baseReview.Group.Files.Concat([secondKeep, pending]).ToArray()
+                    },
+                    Status = DuplicateGroupReviewStatus.ReadyForCleanup
+                };
+                foreach (var pair in baseReview.DecisionsByFileId) multipleKeepReview.DecisionsByFileId.Add(pair.Key, pair.Value);
+                multipleKeepReview.DecisionsByFileId.Add(secondKeep.Id, DuplicateFileDecision.Keep);
+                multipleKeepReview.DecisionsByFileId.Add(pending.Id, DuplicateFileDecision.Undecided);
+                CleanupPreflightResult multiKeep = await new GoogleDriveTrashService()
+                    .PreflightPersistedPlanAsync(drive, multipleKeepReview, cancellationToken);
+                string[] requestedIds = multiKeepTransport.Requests.Where(request => request.FileId is not null)
+                    .Select(request => request.FileId!).OrderBy(id => id, StringComparer.Ordinal).ToArray();
+                multipleKeepsCheckedAndUndecidedExcluded = multiKeep.IsSuccessful &&
+                    multiKeep.KeepFiles.Select(file => file.Id).OrderBy(id => id, StringComparer.Ordinal)
+                        .SequenceEqual(new[] { "keep-file", "keep-file-2" }, StringComparer.Ordinal) &&
+                    multiKeep.CandidateFiles.Select(file => file.Id).SequenceEqual(["candidate-file"], StringComparer.Ordinal) &&
+                    !requestedIds.Contains("pending-file", StringComparer.Ordinal) &&
+                    multiKeepTransport.Requests.All(request => request.Method == HttpMethod.Get);
+            }
 
             var wrongAccountTransport = new LocalDriveTransport("different-account@example.invalid", ResponseScenario.Valid);
             using (DriveService wrongAccountDrive = wrongAccountTransport.CreateDriveService())
@@ -153,6 +211,36 @@ public static class GoogleDriveTrashPreflightLocalChecks
                 decisionChangeDuringPreflightDiscarded = staleFlag && stalePreflightUnapproved &&
                     staleFailureClassified && staleRequestsWereGetOnly;
             }
+
+            // A second isolated inventory exercises the confirmed execution gate through
+            // a local HTTP handler only; its synthetic PATCH is rejected and must not retry.
+            var simulatedInventory = new ScanInventoryIdentity(AccountKey(Email), RecoverableFullScanService.ScopeKeyValue, "preflight-execution-simulated");
+            await CreateCompletedInventoryAsync(factory, sessions, reviewRepository, simulatedInventory, cancellationToken);
+            var simulatedIdentity = new DuplicateGroupIdentity(simulatedInventory, Size, Hash);
+            await reviewRepository.RegisterGroupAsync(simulatedIdentity, cancellationToken);
+            await reviewRepository.SetExplicitDecisionAsync(simulatedIdentity, "keep-file", DuplicateFileDecision.Keep, cancellationToken);
+            await reviewRepository.SetExplicitDecisionAsync(simulatedIdentity, "candidate-file", DuplicateFileDecision.CandidateForTrash, cancellationToken);
+            await reviewRepository.ConfirmGroupReviewAsync(simulatedIdentity, cancellationToken);
+            var simulatedAdapter = new PersistedCleanupGroupReviewAdapter(factory, mapper);
+            var simulatedScan = new RecoverableFullScanService(mapper, root);
+            var simulatedPreflightCoordinator = new PagedGroupPreflightService(simulatedScan, simulatedAdapter, new GoogleDriveTrashService());
+            var readTransport = new LocalDriveTransport(Email, ResponseScenario.Valid);
+            using var readDrive = readTransport.CreateDriveService();
+            PagedGroupPreflightResult approval = await simulatedPreflightCoordinator.CheckOneGroupAsync(
+                readDrive, simulatedIdentity, cancellationToken: cancellationToken);
+            var executionTransport = new LocalDriveTransport(Email, ResponseScenario.Valid);
+            using var executionSession = new CleanupDriveSession(executionTransport.CreateDriveService());
+            var simulatedCleanup = new PagedGroupCleanupService(simulatedScan, simulatedAdapter, reviewRepository,
+                new GoogleDriveTrashService(), new CleanupHistoryService(Path.Combine(root, "execution-history")));
+            PagedGroupCleanupPlan executionPlan = await simulatedCleanup.PreparePlanAsync(
+                executionSession, approval, cancellationToken: cancellationToken);
+            PagedGroupCleanupConfirmation executionConfirmation = simulatedCleanup.ConfirmPlan(
+                executionPlan, executionPlan.KeepFiles.Select(file => file.Id), executionPlan.CandidateFiles.Select(file => file.Id));
+            CleanupOperationResult simulatedOperation = await simulatedCleanup.ExecuteConfirmedAsync(
+                executionSession, executionConfirmation, cancellationToken: cancellationToken);
+            simulatedExecutionAttemptNotRetried = simulatedOperation.WriteAttempted && simulatedOperation.NoFilesChanged &&
+                executionTransport.Requests.Count(request => request.Method != HttpMethod.Get) == 1 &&
+                executionTransport.Requests.Count(request => request.FileId == "candidate-file" && request.Method != HttpMethod.Get) == 1;
         }
         finally
         {
@@ -183,6 +271,9 @@ public static class GoogleDriveTrashPreflightLocalChecks
             $"getOnly={staleRequestsWereGetOnly}; " +
             $"requests={staleRequestSummary}. " +
             "El resultado, la confirmación o las decisiones pudieron cambiar durante el preflight.");
+        Assert(persistedCleanupPlanPreparedReadOnly, "No se preparó el plan del adaptador persistido mediante transportes simulados de solo lectura.");
+        Assert(multipleKeepsCheckedAndUndecidedExcluded, "El preflight persistido no protegió todos los Keep o consultó un miembro sin decidir.");
+        Assert(simulatedExecutionAttemptNotRetried, "La escritura simulada local no se detuvo tras un único intento rechazado.");
         Assert(noWriteRequestsSent, "Una prueba de preflight emitió una solicitud distinta de GET.");
 
         return new GoogleDriveTrashPreflightCheckResult(validGroupApprovedWithGetOnly,
@@ -190,7 +281,9 @@ public static class GoogleDriveTrashPreflightLocalChecks
             undecidedRejectedBeforeMemberGets, missingFileBlocked, trashedFileBlocked,
             changedSizeAndChecksumBlocked, permissionAndNetworkErrorsClassified,
             cancellationHandledWithoutWrites, accountMismatchRejectedBeforeGroupReads,
-            decisionChangeDuringPreflightDiscarded, noWriteRequestsSent, temporaryDirectoryDeleted);
+            decisionChangeDuringPreflightDiscarded, persistedCleanupPlanPreparedReadOnly,
+            multipleKeepsCheckedAndUndecidedExcluded, simulatedExecutionAttemptNotRetried,
+            noWriteRequestsSent, temporaryDirectoryDeleted);
     }
 
     private static async Task<CleanupPreflightResult> RunPreflightAsync(
@@ -345,7 +438,7 @@ public static class GoogleDriveTrashPreflightLocalChecks
             if (string.Equals(fileId, "root", StringComparison.Ordinal))
                 return JsonResponse(HttpStatusCode.OK, JsonSerializer.Serialize(new { id = "root" }));
 
-            if (fileId is not "keep-file" and not "candidate-file")
+            if (fileId is not "keep-file" and not "keep-file-2" and not "pending-file" and not "candidate-file")
                 return JsonResponse(HttpStatusCode.NotFound, ErrorPayload(HttpStatusCode.NotFound, "Not found."));
             if (_scenario == ResponseScenario.CancelOnFirstFile)
                 await Task.Delay(Timeout.Infinite, cancellationToken);
@@ -363,7 +456,7 @@ public static class GoogleDriveTrashPreflightLocalChecks
             var payload = new
             {
                 id = fileId,
-                name = isCandidate ? "candidate.pdf" : "keep.pdf",
+                name = fileId switch { "candidate-file" => "candidate.pdf", "keep-file-2" => "keep-2.pdf", "pending-file" => "pending.pdf", _ => "keep.pdf" },
                 mimeType = "application/pdf",
                 size = size.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 md5Checksum = checksum,

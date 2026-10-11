@@ -275,6 +275,35 @@ public sealed record PersistedCleanupGroupReview(
         return probe;
     }
 
+    /// <summary>
+    /// Builds the full persisted review contract for the dedicated paged preflight.
+    /// Undecided members remain represented but are never candidates; all Keeps remain visible.
+    /// Callers must have obtained this object through BuildAsync, which verifies confirmation/current inventory.
+    /// </summary>
+    public DuplicateGroupReview CreatePersistedPreflightReview()
+    {
+        if (KeepCount < 1 || CandidateCount < 1 || Review.ReviewedWithoutCleanup || !Review.DecisionsByFileId.Any())
+            throw new InvalidOperationException("El grupo persistido no tiene Keep y candidato explícitos aptos para preflight.");
+        var probe = new DuplicateGroupReview
+        {
+            StableId = Review.StableId,
+            Group = new DuplicateGroup
+            {
+                GroupNumber = Review.Group.GroupNumber,
+                FileSize = Review.Group.FileSize,
+                Md5Checksum = Review.Group.Md5Checksum,
+                Files = Array.AsReadOnly(Review.Group.Files.ToArray())
+            },
+            Status = DuplicateGroupReviewStatus.ReadyForCleanup,
+            ReviewedWithoutCleanup = false,
+            Notes = Review.Notes,
+            LastModifiedUtc = ConfirmedAtUtc
+        };
+        foreach ((string fileId, DuplicateFileDecision decision) in Review.DecisionsByFileId)
+            probe.DecisionsByFileId.Add(fileId, decision);
+        return probe;
+    }
+
     public bool HasSameDecisionSnapshot(PersistedCleanupGroupReview other)
     {
         ArgumentNullException.ThrowIfNull(other);

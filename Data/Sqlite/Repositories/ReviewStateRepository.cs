@@ -82,6 +82,67 @@ public sealed class ReviewStateRepository
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    /// <summary>
+    /// Atomically verifies an exact confirmed decision snapshot and invalidates its inventory.
+    /// This closes the edit race between final validation and the first cleanup write.
+    /// </summary>
+    public async Task InvalidateInventoryIfGroupSnapshotMatchesAsync(
+        DuplicateGroupIdentity identity,
+        IReadOnlyDictionary<string, DuplicateFileDecision> expectedDecisions,
+        DateTimeOffset expectedConfirmedAtUtc,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        ArgumentNullException.ThrowIfNull(expectedDecisions);
+        ValidateInventory(identity.Inventory);
+        await using SqliteConnection connection = await _connectionFactory.OpenAsync(cancellationToken);
+        ConfigureComparison(connection);
+        await using SqliteTransaction transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        await EnsureActiveInventoryAsync(connection, transaction, identity.Inventory, cancellationToken);
+        await ValidateRegisteredGroupCurrentAsync(connection, transaction, identity, cancellationToken);
+
+        ReviewGroupPersistenceState state = await ReadGroupStateAsync(connection, transaction, identity, cancellationToken)
+            ?? throw new InvalidOperationException("El grupo dejó de estar registrado antes de iniciar la operación.");
+        if (!state.IsReviewConfirmed || state.ReviewedWithoutCleanup || state.LastModifiedAtUtc != expectedConfirmedAtUtc)
+            throw new InvalidOperationException("La confirmación o el estado del grupo cambió antes de iniciar la operación.");
+
+        var actual = new Dictionary<string, DuplicateFileDecision>(StringComparer.Ordinal);
+        await using (SqliteCommand read = connection.CreateCommand())
+        {
+            read.Transaction = transaction;
+            read.CommandText = """
+                SELECT FileId, Decision FROM ReviewFileDecisions
+                WHERE AccountKey=$accountKey AND ScopeKey=$scopeKey AND ScanId=$scanId
+                  AND SizeBytes=$sizeBytes AND NormalizedChecksum=$checksum COLLATE BINARY;
+                """;
+            AddGroupParameters(read, identity);
+            await using SqliteDataReader reader = await read.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                actual.Add(reader.GetString(0), (DuplicateFileDecision)reader.GetInt32(1));
+        }
+
+        if (actual.Count != expectedDecisions.Count || expectedDecisions.Any(pair =>
+                !actual.TryGetValue(pair.Key, out DuplicateFileDecision decision) || decision != pair.Value))
+            throw new InvalidOperationException("Las decisiones cambiaron antes de iniciar la operación; el inventario no se invalidó ni se ejecutó nada.");
+        if (!actual.Values.Contains(DuplicateFileDecision.Keep) ||
+            !actual.Values.Contains(DuplicateFileDecision.CandidateForTrash))
+            throw new InvalidOperationException("La instantánea confirmada ya no contiene Keep y candidatos explícitos.");
+
+        await using (SqliteCommand invalidate = connection.CreateCommand())
+        {
+            invalidate.Transaction = transaction;
+            invalidate.CommandText = """
+                UPDATE ReviewInventories SET IsObsolete=1, InvalidatedAtUtc=$at
+                WHERE AccountKey=$accountKey AND ScopeKey=$scopeKey AND ScanId=$scanId AND IsObsolete=0;
+                """;
+            AddInventoryParameters(invalidate, identity.Inventory);
+            invalidate.Parameters.AddWithValue("$at", SqlitePersistenceFormat.ToUtcText(DateTimeOffset.UtcNow));
+            if (await invalidate.ExecuteNonQueryAsync(cancellationToken) != 1)
+                throw new InvalidOperationException("El inventario dejó de estar vigente antes de iniciar la operación.");
+        }
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     public async Task<ReviewGroupPersistenceState> RegisterGroupAsync(
         DuplicateGroupIdentity identity,
         CancellationToken cancellationToken = default)

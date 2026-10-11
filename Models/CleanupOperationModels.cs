@@ -88,6 +88,9 @@ public sealed class CleanupPreflightResult
 
     public CleanupFileSnapshot? KeepFile { get; set; }
 
+    /// <summary>All explicitly retained copies for persisted paged reviews; KeepFile remains the legacy single-anchor field.</summary>
+    public List<CleanupFileSnapshot> KeepFiles { get; set; } = [];
+
     public List<CleanupFileSnapshot> CandidateFiles { get; } = [];
 }
 
@@ -161,6 +164,9 @@ public sealed class CleanupOperationRecord
     public required string Md5Checksum { get; init; }
 
     public CleanupFileSnapshot? KeepFile { get; set; }
+
+    /// <summary>All explicit Keep decisions; KeepFile remains the legacy single-anchor field.</summary>
+    public List<CleanupFileSnapshot> KeepFiles { get; } = [];
 
     public List<CleanupFileSnapshot> CandidateFiles { get; } = [];
 

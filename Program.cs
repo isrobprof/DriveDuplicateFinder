@@ -38,6 +38,7 @@ static class Program
             ReviewStatePersistence = await Data.Sqlite.ReviewStatePersistenceLocalChecks.VerifyAsync(),
             PersistedCleanupGroupReviewAdapter = await Data.Sqlite.PersistedCleanupGroupReviewAdapterLocalChecks.VerifyAsync(),
             GoogleDriveTrashPreflight = await Services.GoogleDriveTrashPreflightLocalChecks.VerifyAsync(),
+            PagedGroupCleanup = await Services.PagedGroupCleanupLocalChecks.VerifyAsync(),
             PagedReadOnlyView = Services.PagedReadOnlyViewLocalChecks.Verify(),
             DemoReviewIsolation = await Services.DemoReviewData.VerifyIsolationAsync()
         };
