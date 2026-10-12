@@ -6,8 +6,8 @@ using Google.Apis.Drive.v3;
 namespace DriveDuplicateFinder.Services;
 
 /// <summary>
-/// Prepares a one-group cleanup capability for a future explicit confirmation flow.
-/// It is deliberately not referenced by Form1: the paged UI remains read-only in this phase.
+/// Coordinates paged cleanup preparation and execution. Form1 may call only the local-only
+/// preview method; the remote preflight and execution capability methods remain disconnected.
 /// </summary>
 public sealed class PagedGroupCleanupService
 {
@@ -30,6 +30,71 @@ public sealed class PagedGroupCleanupService
         _reviews = reviews ?? throw new ArgumentNullException(nameof(reviews));
         _trash = trash ?? throw new ArgumentNullException(nameof(trash));
         _history = history ?? throw new ArgumentNullException(nameof(history));
+    }
+
+    /// <summary>
+    /// Loads and validates the complete confirmed group from SQLite for a non-executable UI preview.
+    /// This method performs no OAuth, Drive reads, history writes, or Drive writes.
+    /// </summary>
+    public async Task<PagedGroupCleanupLocalPreview> PrepareLocalPreviewAsync(
+        DuplicateGroupIdentity identity,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        cancellationToken.ThrowIfCancellationRequested();
+        PersistedCleanupGroupReview localReview = await _adapter.BuildAsync(identity, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        DriveFileInfo[] members = localReview.Review.Group.Files.ToArray();
+        if (members.LongLength != localReview.MemberCount ||
+            localReview.Review.DecisionsByFileId.Count != localReview.MemberCount ||
+            members.Select(file => file.Id).Distinct(StringComparer.Ordinal).Count() != members.Length)
+            throw new InvalidOperationException("SQLite no devolvió una revisión completa y consistente del grupo.");
+
+        var entries = new List<PagedGroupCleanupLocalPreviewEntry>();
+        long keepCount = 0;
+        long candidateCount = 0;
+        long undecidedCount = 0;
+        foreach (DriveFileInfo member in members)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!localReview.Review.DecisionsByFileId.TryGetValue(member.Id, out DuplicateFileDecision decision))
+                throw new InvalidOperationException("Falta una decisión persistida para un miembro del grupo.");
+            switch (decision)
+            {
+                case DuplicateFileDecision.Keep:
+                    keepCount++;
+                    entries.Add(new PagedGroupCleanupLocalPreviewEntry(member, decision));
+                    break;
+                case DuplicateFileDecision.CandidateForTrash:
+                    candidateCount++;
+                    entries.Add(new PagedGroupCleanupLocalPreviewEntry(member, decision));
+                    break;
+                case DuplicateFileDecision.Undecided:
+                    undecidedCount++;
+                    break;
+                default:
+                    throw new InvalidOperationException("El grupo contiene una decisión local desconocida.");
+            }
+        }
+
+        if (keepCount != localReview.KeepCount || candidateCount != localReview.CandidateCount ||
+            undecidedCount != localReview.UndecidedCount || keepCount == 0 || candidateCount == 0)
+            throw new InvalidOperationException("Las decisiones cambiaron o el grupo ya no es apto; vuelve a confirmarlo.");
+
+        PagedGroupCleanupLocalPreviewEntry[] ordered = entries
+            .OrderBy(entry => entry.Decision)
+            .ThenBy(entry => entry.File.Id, StringComparer.Ordinal)
+            .ToArray();
+        return new PagedGroupCleanupLocalPreview(
+            localReview.Identity,
+            localReview.ConfirmedAtUtc,
+            localReview.MemberCount,
+            keepCount,
+            candidateCount,
+            undecidedCount,
+            new System.Numerics.BigInteger(identity.SizeBytes) * candidateCount,
+            Array.AsReadOnly(ordered));
     }
 
     public async Task<PagedGroupCleanupPlan> PreparePlanAsync(
@@ -201,6 +266,27 @@ public sealed class PagedGroupCleanupService
         ArgumentNullException.ThrowIfNull(plan);
         if (plan.Owner != _owner) throw new InvalidOperationException("El plan pertenece a otra sesión de servicio.");
     }
+}
+
+/// <summary>One explicitly decided member shown in a local-only preview.</summary>
+public sealed record PagedGroupCleanupLocalPreviewEntry(DriveFileInfo File, DuplicateFileDecision Decision);
+
+/// <summary>
+/// Immutable local snapshot for display only. It is intentionally not accepted by ConfirmPlan
+/// or ExecuteConfirmedAsync; remote preflight remains pending and execution is disabled.
+/// </summary>
+public sealed record PagedGroupCleanupLocalPreview(
+    DuplicateGroupIdentity Identity,
+    DateTimeOffset ConfirmedAtUtc,
+    long MemberCount,
+    long KeepCount,
+    long CandidateCount,
+    long UndecidedExcludedCount,
+    System.Numerics.BigInteger PotentiallyRecoverableBytes,
+    IReadOnlyList<PagedGroupCleanupLocalPreviewEntry> Entries)
+{
+    public bool RemotePreflightPending => true;
+    public bool ExecutionEnabled => false;
 }
 
 public sealed class PagedGroupCleanupPlan

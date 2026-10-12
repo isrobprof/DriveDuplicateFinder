@@ -18,6 +18,7 @@ public sealed record PersistedCleanupGroupReviewAdapterCheckResult(
     bool WrongScopeRejected,
     bool ForeignFileIdRejected,
     bool OversizedGroupRejectedBeforeMemberRead,
+    bool LocalPlanOversizedRejectedBeforeMemberRead,
     bool CancellationReturnsNoPartialReview,
     bool AdapterHasNoRemoteExecutionDependency);
 
@@ -146,6 +147,17 @@ public static class PersistedCleanupGroupReviewAdapterLocalChecks
                     exception.MaximumMembers == PersistedCleanupGroupReviewAdapter.MaximumMembersPerGroup;
             }
 
+            var localPlanCoordinator = new PagedGroupCleanupService(
+                new RecoverableFullScanService(new GoogleDriveFileService(), root), adapter, reviews,
+                new GoogleDriveTrashService(), new CleanupHistoryService(Path.Combine(root, "unused-history")));
+            bool localPlanOversizedRejectedBeforeMemberRead = false;
+            try { _ = await localPlanCoordinator.PrepareLocalPreviewAsync(oversized, cancellationToken); }
+            catch (CleanupGroupMemberLimitExceededException exception)
+            {
+                localPlanOversizedRejectedBeforeMemberRead = exception.MemberCount == 2_001 &&
+                    exception.MaximumMembers == PersistedCleanupGroupReviewAdapter.MaximumMembersPerGroup;
+            }
+
             bool wrongScopeRejected = false;
             var wrongScope = new DuplicateGroupIdentity(
                 new ScanInventoryIdentity(inventory.AccountKey, "different-scope", inventory.ScanId), 100, NormalHash);
@@ -194,6 +206,7 @@ public static class PersistedCleanupGroupReviewAdapterLocalChecks
                 "Se aceptó una sesión antigua, incompleta o de otra cuenta.");
             Assert(foreignFileIdRejected, "Se aceptó una decisión con FileId ajeno al grupo.");
             Assert(oversizedRejectedBeforeMemberRead, "Un grupo mayor de 2.000 no se rechazó antes de leer miembros.");
+            Assert(localPlanOversizedRejectedBeforeMemberRead, "La preparación del plan local no rechazó el grupo mayor de 2.000 antes de leer miembros.");
             Assert(cancellationReturnsNoPartialReview, "La cancelación no detuvo la adaptación antes de producir un resultado.");
             Assert(adapterHasNoRemoteExecutionDependency, "El adaptador adquirió una dependencia de Drive remoto.");
 
@@ -201,7 +214,8 @@ public static class PersistedCleanupGroupReviewAdapterLocalChecks
                 largeGroupPagesAndPendingMappedExactly, multipleKeepDecisionsPreserved,
                 preflightProjectionKeepsOnlyExplicitCandidates, changedConfirmationRejected,
                 oldRejected && wrongAccountRejected && incompleteRejected, wrongScopeRejected, foreignFileIdRejected,
-                oversizedRejectedBeforeMemberRead, cancellationReturnsNoPartialReview, adapterHasNoRemoteExecutionDependency);
+                oversizedRejectedBeforeMemberRead, localPlanOversizedRejectedBeforeMemberRead,
+                cancellationReturnsNoPartialReview, adapterHasNoRemoteExecutionDependency);
         }
         finally
         {

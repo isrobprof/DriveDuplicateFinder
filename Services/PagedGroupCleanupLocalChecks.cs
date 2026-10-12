@@ -35,7 +35,12 @@ public sealed record PagedGroupCleanupLocalCheckResult(
     bool NoRetriesAfterUncertainResponse,
     bool NoRetriesAfterCancellation,
     bool NoAutomaticWriteRetries,
-    bool NoWritesFromPagedUi);
+    bool NoWritesFromPagedUi,
+    bool LocalPreviewCompleteCrossPagePlan,
+    bool LocalPreviewRejectsWrongIdentityAndStaleInventory,
+    bool LocalPreviewDiscardsObsoleteRequest,
+    bool LocalPreviewIsNonExecutableAndRemotePending,
+    bool LocalPreviewUiSurfacesBlocks);
 
 /// <summary>Deterministic coordinator and write-outcome checks using temporary SQLite and a local HTTP handler.</summary>
 public static class PagedGroupCleanupLocalChecks
@@ -61,6 +66,58 @@ public static class PagedGroupCleanupLocalChecks
             fixture => fixture.Reviews.SetExplicitDecisionAsync(fixture.Identity, "candidate-1", DuplicateFileDecision.Keep, cancellationToken), cancellationToken);
         bool candidateToUndecided = await RejectedAfterMutationAsync(FixtureKind.Standard,
             fixture => fixture.Reviews.SetExplicitDecisionAsync(fixture.Identity, "candidate-1", DuplicateFileDecision.Undecided, cancellationToken), cancellationToken);
+
+        bool localPreviewCompleteCrossPagePlan = false;
+        bool localPreviewRejectsWrongIdentityAndStaleInventory = false;
+        bool localPreviewDiscardsObsoleteRequest = false;
+        bool localPreviewIsNonExecutableAndRemotePending = false;
+        await using (TestFixture fixture = await TestFixture.CreateAsync(FixtureKind.CrossPageDecisions,
+                         cancellationToken, prepareApproval: false))
+        {
+            PagedGroupCleanupLocalPreview preview = await fixture.Coordinator.PrepareLocalPreviewAsync(fixture.Identity, cancellationToken);
+            string[] keepIds = preview.Entries.Where(entry => entry.Decision == DuplicateFileDecision.Keep)
+                .Select(entry => entry.File.Id).OrderBy(id => id, StringComparer.Ordinal).ToArray();
+            string[] candidateIds = preview.Entries.Where(entry => entry.Decision == DuplicateFileDecision.CandidateForTrash)
+                .Select(entry => entry.File.Id).OrderBy(id => id, StringComparer.Ordinal).ToArray();
+            localPreviewCompleteCrossPagePlan = preview.MemberCount == 205 && preview.KeepCount == 2 &&
+                preview.CandidateCount == 100 && preview.UndecidedExcludedCount == 103 && preview.Entries.Count == 102 &&
+                keepIds.SequenceEqual(new[] { "z-keep-001", "z-keep-002" }, StringComparer.Ordinal) &&
+                candidateIds.SequenceEqual(Enumerable.Range(0, 100).Select(index => $"a-candidate-{index:D3}"), StringComparer.Ordinal) &&
+                preview.PotentiallyRecoverableBytes == new System.Numerics.BigInteger(Size) * 100 &&
+                fixture.TotalRemoteRequests == 0;
+            localPreviewIsNonExecutableAndRemotePending = preview.RemotePreflightPending && !preview.ExecutionEnabled &&
+                typeof(PagedGroupCleanupService).GetMethod(nameof(PagedGroupCleanupService.PrepareLocalPreviewAsync)) is { } method &&
+                method.GetParameters().All(parameter => parameter.ParameterType != typeof(CleanupDriveSession) &&
+                    parameter.ParameterType != typeof(DriveService));
+
+            bool wrongAccountRejected = await LocalPreviewRejectedAsync(fixture,
+                new DuplicateGroupIdentity(new ScanInventoryIdentity("other-account", fixture.Inventory.ScopeKey,
+                    fixture.Inventory.ScanId), fixture.Identity.SizeBytes, fixture.Identity.NormalizedChecksum), cancellationToken);
+            bool wrongScopeRejected = await LocalPreviewRejectedAsync(fixture,
+                new DuplicateGroupIdentity(new ScanInventoryIdentity(fixture.Inventory.AccountKey, "other-scope",
+                    fixture.Inventory.ScanId), fixture.Identity.SizeBytes, fixture.Identity.NormalizedChecksum), cancellationToken);
+            bool wrongScanRejected = await LocalPreviewRejectedAsync(fixture,
+                new DuplicateGroupIdentity(new ScanInventoryIdentity(fixture.Inventory.AccountKey, fixture.Inventory.ScopeKey,
+                    "other-scan"), fixture.Identity.SizeBytes, fixture.Identity.NormalizedChecksum), cancellationToken);
+
+            var generation = new PagedRequestGeneration();
+            PagedRequestLease preparing = generation.Begin();
+            await fixture.Reviews.SetExplicitDecisionAsync(fixture.Identity, "a-candidate-000",
+                DuplicateFileDecision.Undecided, cancellationToken);
+            PagedRequestLease replacement = generation.Begin();
+            bool generationInvalidated = preparing.Token.IsCancellationRequested && !generation.IsCurrent(preparing) &&
+                generation.IsCurrent(replacement);
+            generation.Complete(preparing);
+            generation.Complete(replacement);
+            bool changedDecisionRejected = await LocalPreviewRejectedAsync(fixture, fixture.Identity, cancellationToken);
+            localPreviewDiscardsObsoleteRequest = generationInvalidated && changedDecisionRejected;
+
+            await fixture.Sessions.UpdateStatusAsync(fixture.Inventory.ScanId, ScanStatus.Paused,
+                DateTimeOffset.UtcNow, "offline stale inventory fixture", cancellationToken);
+            bool staleSessionRejected = await LocalPreviewRejectedAsync(fixture, fixture.Identity, cancellationToken);
+            localPreviewRejectsWrongIdentityAndStaleInventory = wrongAccountRejected && wrongScopeRejected &&
+                wrongScanRejected && staleSessionRejected;
+        }
 
         bool stalePreflightRejected = false;
         await using (TestFixture fixture = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken))
@@ -200,7 +257,9 @@ public static class PagedGroupCleanupLocalChecks
             cancelledSafely, keepsAndUndecidedProtected, oldConfirmationRejected,
             noRetriesForFailure, noRetryAfterUncertain, noRetriesForCancellation,
             noRetriesForFailure && noRetryAfterUncertain && noRetriesForCancellation,
-            NoPagedCleanupUiReferences());
+            NoPagedCleanupUiReferences(), localPreviewCompleteCrossPagePlan,
+            localPreviewRejectsWrongIdentityAndStaleInventory, localPreviewDiscardsObsoleteRequest,
+            localPreviewIsNonExecutableAndRemotePending, PagedPreviewUiSurfacesBlocks());
 
         Assert(accountChange, "Cambiar AccountKey no rechazó la ejecución antes de PATCH.");
         Assert(scopeChange, "Cambiar ScopeKey no rechazó la ejecución antes de PATCH.");
@@ -224,7 +283,28 @@ public static class PagedGroupCleanupLocalChecks
         Assert(checks.NoRetriesAfterCancellation, "Se emitieron escrituras adicionales después de cancelar entre archivos.");
         Assert(checks.NoAutomaticWriteRetries, "Se reintentó automáticamente una escritura fallida, incierta o cancelada.");
         Assert(checks.NoWritesFromPagedUi, "Form1 contiene una referencia a la ruta paginada de ejecución de limpieza.");
+        Assert(checks.LocalPreviewCompleteCrossPagePlan, "La vista previa local no reconstruyó todas las decisiones repartidas entre páginas o calculó mal los bytes.");
+        Assert(checks.LocalPreviewRejectsWrongIdentityAndStaleInventory, "La vista previa aceptó otra cuenta, alcance, sesión o un inventario no vigente.");
+        Assert(checks.LocalPreviewDiscardsObsoleteRequest, "Una preparación obsoleta o una confirmación invalidada produjo un plan visible.");
+        Assert(checks.LocalPreviewIsNonExecutableAndRemotePending, "La vista previa local adquirió capacidad de ejecución o se presentó como preflight remoto.");
+        Assert(checks.LocalPreviewUiSurfacesBlocks, "La interfaz no conecta la preparación local o no presenta los bloqueos del adaptador.");
         return checks;
+    }
+
+    private static async Task<bool> LocalPreviewRejectedAsync(
+        TestFixture fixture,
+        DuplicateGroupIdentity identity,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            _ = await fixture.Coordinator.PrepareLocalPreviewAsync(identity, cancellationToken);
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
     }
 
     private static async Task<bool> RejectedAfterMutationAsync(
@@ -245,13 +325,45 @@ public static class PagedGroupCleanupLocalChecks
 
     private static bool NoPagedCleanupUiReferences()
     {
-        // PagedGroupCleanupService has no call site in Form1; paged actions are guarded separately.
+        // Form1 may call only the local preview method; execution stays disconnected.
         string sourcePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "Form1.cs"));
         if (!File.Exists(sourcePath) || PagedReadOnlyViewSafety.LegacyActionsEnabled(pagedReadOnlyMode: true)) return false;
         string source = File.ReadAllText(sourcePath);
-        return !source.Contains("PagedGroupCleanupService", StringComparison.Ordinal) &&
+        string? handler = ExtractHandler(source, "btnPagedPrepareGroupPlan_Click");
+        return source.Contains("_pagedGroupCleanupService.PrepareLocalPreviewAsync(identity, request.Token)", StringComparison.Ordinal) &&
+            !source.Contains("_pagedGroupCleanupService.ExecuteConfirmedAsync", StringComparison.Ordinal) &&
+            handler is not null &&
+            !handler.Contains("ExecuteConfirmedAsync", StringComparison.Ordinal) &&
+            !handler.Contains("_cleanupBatchService.ExecuteAsync", StringComparison.Ordinal) &&
+            !handler.Contains("_trashService.ExecuteAsync", StringComparison.Ordinal) &&
             HandlerHasPagedGuardBeforeExecution(source, "btnEnviarGruposPapelera_Click", "_cleanupBatchService.ExecuteAsync") &&
             HandlerHasPagedGuardBeforeExecution(source, "btnEnviarGrupoPapelera_Click", "_trashService.ExecuteAsync");
+    }
+
+    private static bool PagedPreviewUiSurfacesBlocks()
+    {
+        string formPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "Form1.cs"));
+        string previewPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "PagedGroupCleanupLocalPreviewForm.cs"));
+        if (!File.Exists(formPath) || !File.Exists(previewPath)) return false;
+        string? handler = ExtractHandler(File.ReadAllText(formPath), "btnPagedPrepareGroupPlan_Click");
+        if (handler is null) return false;
+        string preview = File.ReadAllText(previewPath);
+        return handler.Contains("_pagedGroupReviewConfirmed", StringComparison.Ordinal) &&
+            handler.Contains("exception.Message", StringComparison.Ordinal) && handler.Contains("MessageBox.Show", StringComparison.Ordinal) &&
+            handler.Contains("_pagedRequestGeneration.IsCurrent(request)", StringComparison.Ordinal) &&
+            handler.Contains("_activePagedGroup != identity", StringComparison.Ordinal) &&
+            preview.Contains("UndecidedExcludedCount", StringComparison.Ordinal) &&
+            preview.Contains("PREPARACIÓN LOCAL NO EJECUTABLE", StringComparison.Ordinal) &&
+            preview.Contains("preflight remoto", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? ExtractHandler(string source, string handlerName)
+    {
+        int start = source.IndexOf("private async void " + handlerName, StringComparison.Ordinal);
+        if (start < 0) return null;
+        int end = source.IndexOf("\n    private ", start + handlerName.Length, StringComparison.Ordinal);
+        if (end < 0) end = source.Length;
+        return source[start..end];
     }
 
     private static bool HandlerHasPagedGuardBeforeExecution(string source, string handlerName, string executionCall)
@@ -271,7 +383,7 @@ public static class PagedGroupCleanupLocalChecks
         if (!condition) throw new InvalidOperationException(message);
     }
 
-    private enum FixtureKind { Standard, TwoKeeps, MultipleCandidates }
+    private enum FixtureKind { Standard, TwoKeeps, MultipleCandidates, CrossPageDecisions }
     private enum WriteBehavior { None, Success, FailSecondBeforeApply, LoseSecondResponseAfterApply }
     private sealed record CapturedRequest(HttpMethod Method, string? FileId);
 
@@ -303,8 +415,12 @@ public static class PagedGroupCleanupLocalChecks
         public GoogleDriveTrashService Trash { get; }
         public PagedGroupCleanupService Coordinator { get; }
         public PagedGroupPreflightResult Approval { get; private set; } = null!;
+        public int TotalRemoteRequests => _transports.Values.Sum(transport => transport.Requests.Count);
 
-        public static async Task<TestFixture> CreateAsync(FixtureKind kind, CancellationToken token)
+        public static async Task<TestFixture> CreateAsync(
+            FixtureKind kind,
+            CancellationToken token,
+            bool prepareApproval = true)
         {
             string root = Path.Combine(Path.GetTempPath(), "DriveDuplicateFinder", $"paged-cleanup-{Guid.NewGuid():N}");
             Directory.CreateDirectory(root);
@@ -321,11 +437,14 @@ public static class PagedGroupCleanupLocalChecks
                 DriveFileInfo[] files = FilesFor(kind);
                 await CreateInventoryAsync(factory, sessions, reviews, inventory, identity, files, token);
                 var fixture = new TestFixture(root, factory, sessions, reviews, inventory, identity, new GoogleDriveFileService());
-                using DriveService readDrive = new LocalTransport(Email, WriteBehavior.None).CreateDrive();
-                fixture.Approval = await new PagedGroupPreflightService(fixture.Scan, fixture.Adapter, fixture.Trash)
-                    .CheckOneGroupAsync(readDrive, identity, cancellationToken: token);
-                if (!fixture.Approval.Preflight.IsSuccessful || fixture.Approval.IsStale)
-                    throw new InvalidOperationException("La aprobación local de preflight no se pudo construir en el fixture.");
+                if (prepareApproval)
+                {
+                    using DriveService readDrive = new LocalTransport(Email, WriteBehavior.None).CreateDrive();
+                    fixture.Approval = await new PagedGroupPreflightService(fixture.Scan, fixture.Adapter, fixture.Trash)
+                        .CheckOneGroupAsync(readDrive, identity, cancellationToken: token);
+                    if (!fixture.Approval.Preflight.IsSuccessful || fixture.Approval.IsStale)
+                        throw new InvalidOperationException("La aprobación local de preflight no se pudo construir en el fixture.");
+                }
                 return fixture;
             }
             catch
@@ -393,6 +512,10 @@ public static class PagedGroupCleanupLocalChecks
             {
                 FixtureKind.TwoKeeps => ["keep-file", "keep-file-2", "candidate-1"],
                 FixtureKind.MultipleCandidates => ["keep-file", "keep-file-2", "candidate-1", "candidate-2", "pending-file"],
+                FixtureKind.CrossPageDecisions => [
+                    .. Enumerable.Range(0, 100).Select(index => $"a-candidate-{index:D3}"),
+                    .. Enumerable.Range(0, 103).Select(index => $"m-pending-{index:D3}"),
+                    "z-keep-001", "z-keep-002"],
                 _ => ["keep-file", "candidate-1"]
             };
             return ids.Select(id => new DriveFileInfo
@@ -430,10 +553,10 @@ public static class PagedGroupCleanupLocalChecks
             await sessions.UpdateStatusAsync(inventory.ScanId, ScanStatus.Completed, DateTimeOffset.UtcNow, cancellationToken: token);
             await reviews.RegisterCompletedInventoryAsync(inventory, token);
             await reviews.RegisterGroupAsync(identity, token);
-            await reviews.SetExplicitDecisionAsync(identity, "keep-file", DuplicateFileDecision.Keep, token);
-            if (files.Any(file => file.Id == "keep-file-2"))
-                await reviews.SetExplicitDecisionAsync(identity, "keep-file-2", DuplicateFileDecision.Keep, token);
-            foreach (DriveFileInfo file in files.Where(file => file.Id.StartsWith("candidate-", StringComparison.Ordinal)))
+            foreach (DriveFileInfo file in files.Where(file => file.Id.StartsWith("keep-", StringComparison.Ordinal) ||
+                         file.Id.StartsWith("z-keep-", StringComparison.Ordinal)))
+                await reviews.SetExplicitDecisionAsync(identity, file.Id, DuplicateFileDecision.Keep, token);
+            foreach (DriveFileInfo file in files.Where(file => file.Id.Contains("candidate-", StringComparison.Ordinal)))
                 await reviews.SetExplicitDecisionAsync(identity, file.Id, DuplicateFileDecision.CandidateForTrash, token);
             await reviews.ConfirmGroupReviewAsync(identity, token);
         }

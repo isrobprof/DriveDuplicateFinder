@@ -23,6 +23,7 @@ public partial class Form1 : Form
     private readonly RecoverableFullScanService _recoverableFullScanService;
     private readonly PersistedCleanupGroupReviewAdapter _pagedPreflightAdapter;
     private readonly PagedGroupPreflightService _pagedGroupPreflightService;
+    private readonly PagedGroupCleanupService _pagedGroupCleanupService;
     private readonly ReviewStateRepository _reviewStateRepository;
     private readonly DuplicateFinderService _duplicateFinderService = new();
     private readonly DuplicateReviewService _reviewService = new();
@@ -77,6 +78,7 @@ public partial class Form1 : Form
     private bool _isBindingPagedMembers;
     private bool _pagedReviewWriteInProgress;
     private bool _pagedPreflightInProgress;
+    private bool _pagedLocalPlanPreparationInProgress;
     private bool _pagedGroupReviewConfirmed;
 
     private readonly GroupBox grpFiltros = new();
@@ -135,6 +137,7 @@ public partial class Form1 : Form
     private readonly Button btnPagedConfirmGroup = new();
     private readonly Button btnPagedSkipGroup = new();
     private readonly Button btnPagedViewCleanupPlan = new();
+    private readonly Button btnPagedPrepareGroupPlan = new();
     private readonly Button btnPagedCheckDrive = new();
     private readonly Button btnReopenLatestScan = new();
     private const int PagedGroupPageSize = 1;
@@ -153,6 +156,8 @@ public partial class Form1 : Form
         _pagedPreflightAdapter = new PersistedCleanupGroupReviewAdapter(connectionFactory, _fileService);
         _pagedGroupPreflightService = new PagedGroupPreflightService(
             _recoverableFullScanService, _pagedPreflightAdapter, _trashService);
+        _pagedGroupCleanupService = new PagedGroupCleanupService(
+            _recoverableFullScanService, _pagedPreflightAdapter, _reviewStateRepository, _trashService, _cleanupHistoryService);
         _recommendationBatchService = new RecommendationBatchService(_recommendationApplicationService, _reviewService);
         _cleanupBatchService = new CleanupBatchService(_trashService);
         InitializeComponent();
@@ -750,11 +755,12 @@ public partial class Form1 : Form
         ConfigureButton(btnPagedNextMemberPage, "Más miembros", btnPagedNextMemberPage_Click);
         ConfigureButton(btnPagedConfirmGroup, "Confirmar revisión", btnPagedConfirmGroup_Click);
         ConfigureButton(btnPagedSkipGroup, "Saltar grupo", btnPagedSkipGroup_Click);
-        ConfigureButton(btnPagedViewCleanupPlan, "Ver plan de limpieza", btnPagedViewCleanupPlan_Click);
+        ConfigureButton(btnPagedViewCleanupPlan, "Plan de todos los grupos", btnPagedViewCleanupPlan_Click);
+        ConfigureButton(btnPagedPrepareGroupPlan, "Preparar plan del grupo (solo local)", btnPagedPrepareGroupPlan_Click);
         ConfigureButton(btnPagedCheckDrive, "Comprobar en Google Drive", btnPagedCheckDrive_Click);
         lblPagedMembersPage.AutoSize = true;
         lblPagedMembersPage.Padding = new Padding(4, 6, 0, 0);
-        memberNavigation.Controls.AddRange([btnPagedPreviousMemberPage, btnPagedNextMemberPage, btnPagedConfirmGroup, btnPagedSkipGroup, btnPagedViewCleanupPlan, btnPagedCheckDrive, lblPagedMembersPage]);
+        memberNavigation.Controls.AddRange([btnPagedPreviousMemberPage, btnPagedNextMemberPage, btnPagedConfirmGroup, btnPagedSkipGroup, btnPagedPrepareGroupPlan, btnPagedViewCleanupPlan, btnPagedCheckDrive, lblPagedMembersPage]);
         var reviewNotice = new Label
         {
             AutoSize = true,
@@ -1064,6 +1070,9 @@ public partial class Form1 : Form
         btnPagedConfirmGroup.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy && _pagedKeepCount > 0 && _pagedCandidateCount > 0;
         btnPagedSkipGroup.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy;
         btnPagedViewCleanupPlan.Enabled = _pagedReadOnlyMode && _pagedInventory is not null && !pagedBusy;
+        btnPagedPrepareGroupPlan.Enabled = _pagedReadOnlyMode && _pagedInventory is not null && hasMembers &&
+            _pagedGroupReviewConfirmed && _pagedKeepCount > 0 && _pagedCandidateCount > 0 &&
+            !_pagedReviewWriteInProgress && !_pagedPreflightInProgress && !_pagedLocalPlanPreparationInProgress;
         btnPagedCheckDrive.Enabled = _pagedReadOnlyMode && !_demoMode && _driveService is not null &&
             _pagedInventory is not null && hasMembers && _pagedGroupReviewConfirmed &&
             _pagedKeepCount > 0 && _pagedCandidateCount > 0 && !pagedBusy;
@@ -1190,6 +1199,59 @@ public partial class Form1 : Form
         if (!_pagedReadOnlyMode || _pagedInventory is null || _pagedReviewWriteInProgress) return;
         using var preview = new PagedCleanupPlanPreviewForm(_recoverableFullScanService, _pagedInventory);
         preview.ShowDialog(this);
+    }
+
+    private async void btnPagedPrepareGroupPlan_Click(object? sender, EventArgs e)
+    {
+        if (!_pagedReadOnlyMode || _pagedInventory is null ||
+            _activePagedGroup is not DuplicateGroupIdentity identity || identity.Inventory != _pagedInventory ||
+            !_pagedGroupReviewConfirmed || _pagedKeepCount < 1 || _pagedCandidateCount < 1 ||
+            _pagedReviewWriteInProgress || _pagedPreflightInProgress || _pagedLocalPlanPreparationInProgress)
+            return;
+
+        PagedRequestLease request = _pagedRequestGeneration.Begin();
+        _pagedLocalPlanPreparationInProgress = true;
+        btnCancelar.Enabled = true;
+        lblEstado.Text = "Cargando el grupo completo y sus decisiones desde SQLite para una vista previa local; no se consultará Google Drive.";
+        UpdatePagedNavigationUi();
+        try
+        {
+            PagedGroupCleanupLocalPreview preview = await _pagedGroupCleanupService.PrepareLocalPreviewAsync(identity, request.Token);
+            if (!_pagedRequestGeneration.IsCurrent(request) || !_pagedReadOnlyMode ||
+                _pagedInventory != identity.Inventory || _activePagedGroup != identity)
+                return;
+
+            using var previewForm = new PagedGroupCleanupLocalPreviewForm(preview);
+            previewForm.ShowDialog(this);
+            lblEstado.Text = "Vista previa local cerrada. Preflight remoto pendiente; ejecución real deshabilitada.";
+        }
+        catch (OperationCanceledException) when (request.Token.IsCancellationRequested)
+        {
+            if (!IsDisposed && !Disposing && _pagedRequestGeneration.IsCurrent(request))
+                lblEstado.Text = "Preparación cancelada o sustituida por una navegación/edición nueva; no se mostró un resultado obsoleto.";
+        }
+        catch (Exception exception)
+        {
+            if (_pagedRequestGeneration.IsCurrent(request) && _activePagedGroup == identity)
+            {
+                lblEstado.Text = "No se pudo preparar el plan local; no se realizó ninguna operación remota.";
+                MessageBox.Show(
+                    exception.Message,
+                    "Plan local bloqueado",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+        }
+        finally
+        {
+            _pagedLocalPlanPreparationInProgress = false;
+            _pagedRequestGeneration.Complete(request);
+            if (!IsDisposed && !Disposing)
+            {
+                btnCancelar.Enabled = _searchCancellationTokenSource is not null || _pagedRequestGeneration.HasActiveRequest;
+                UpdatePagedNavigationUi();
+            }
+        }
     }
 
     private async void btnPagedCheckDrive_Click(object? sender, EventArgs e)
