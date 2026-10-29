@@ -1472,19 +1472,35 @@ public partial class Form1 : Form
                 review.ShowDialog(this);
             if (!IsCurrentPagedPreflight(request, identity) || request.Token.IsCancellationRequested) return;
 
-            if (!PagedGroupCleanupService.IsRealExecutionEnabled)
+            bool singleCandidateTrial = !PagedGroupCleanupService.IsRealExecutionEnabled &&
+                PagedGroupCleanupService.IsSingleCandidateTrialExecutionEnabled;
+            if (!PagedGroupCleanupService.IsRealExecutionEnabled && !singleCandidateTrial)
             {
                 const string executionDisabledMessage =
-                    "El preflight de solo lectura está disponible, pero la ejecución real de limpieza paginada aún está deshabilitada. No se solicitará OAuth de escritura ni se enviarán cambios a Google Drive.";
+                    "El preflight de solo lectura está disponible, pero tanto la ejecución general como la prueba limitada de un candidato están deshabilitadas. No se solicitará OAuth de escritura ni se enviarán cambios a Google Drive.";
                 lblEstado.Text = executionDisabledMessage;
                 MessageBox.Show(executionDisabledMessage, "Ejecución real deshabilitada",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
+            if (singleCandidateTrial && PagedGroupCleanupService.GetSingleCandidateTrialBlockReason(
+                    readOnlyPreflight.LocalReview, readOnlyPreflight.Preflight,
+                    requireAllKeepSnapshots: false) is string trialBlockReason)
+            {
+                lblEstado.Text = "La prueba limitada de limpieza no cumple sus límites. No se solicitará OAuth de escritura.";
+                MessageBox.Show(trialBlockReason, "Prueba limitada bloqueada",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
             if (MessageBox.Show(
-                    "El preflight de solo lectura está aprobado para este grupo. ¿Quieres solicitar ahora la autorización OAuth independiente con alcance Drive para preparar la confirmación final? La ejecución real está bloqueada en esta versión y no se enviarán archivos a la papelera.",
-                    "Autorización independiente — limpieza paginada bloqueada",
+                    singleCandidateTrial
+                        ? "La prueba está limitada a un grupo y un candidato explícito de hasta 10.000.000 bytes. Se comprobarán todos los Keep. ¿Solicitas la autorización OAuth independiente con alcance Drive? No se ejecutará hasta confirmar el candidato en el diálogo final."
+                        : "El preflight de solo lectura está aprobado para este grupo. ¿Quieres solicitar ahora la autorización OAuth independiente con alcance Drive para preparar la confirmación final?",
+                    singleCandidateTrial
+                        ? "Autorización independiente — prueba de un candidato"
+                        : "Autorización independiente — limpieza paginada",
                     MessageBoxButtons.YesNo,
                     MessageBoxIcon.Warning) != DialogResult.Yes)
             {
@@ -1497,10 +1513,11 @@ public partial class Form1 : Form
             if (!IsCurrentPagedPreflight(request, identity) || request.Token.IsCancellationRequested) return;
 
             PagedGroupCleanupPlan plan = await _pagedGroupCleanupService.PreparePlanAsync(
-                cleanupSession, readOnlyPreflight, progress, request.Token);
+                cleanupSession, readOnlyPreflight, progress, request.Token, singleCandidateTrial);
             if (!IsCurrentPagedPreflight(request, identity) || request.Token.IsCancellationRequested) return;
 
-            using var finalConfirmation = new PagedGroupCleanupConfirmationForm(plan, offlineSimulation: false);
+            using var finalConfirmation = new PagedGroupCleanupConfirmationForm(
+                plan, offlineSimulation: false, singleCandidateTrial: singleCandidateTrial);
             if (finalConfirmation.ShowDialog(this) != DialogResult.OK ||
                 !IsCurrentPagedPreflight(request, identity) || request.Token.IsCancellationRequested)
             {

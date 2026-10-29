@@ -75,6 +75,8 @@ public sealed class GoogleDriveCleanupAuthService
 /// <summary>Capability wrapper proving this DriveService came from the cleanup-scope authorization flow.</summary>
 public sealed class CleanupDriveSession : IDisposable
 {
+    private int _singleCandidateTrialAttempted;
+
     internal CleanupDriveSession(DriveService driveService, bool isOfflineSimulation = false)
     {
         DriveService = driveService ?? throw new ArgumentNullException(nameof(driveService));
@@ -84,6 +86,12 @@ public sealed class CleanupDriveSession : IDisposable
     internal DriveService DriveService { get; }
 
     internal bool IsOfflineSimulation { get; }
+
+    /// <summary>Consumes this OAuth session's one permitted trial attempt.</summary>
+    internal bool TryBeginSingleCandidateTrialAttempt() =>
+        Interlocked.CompareExchange(ref _singleCandidateTrialAttempted, 1, 0) == 0;
+
+    internal bool HasUsedSingleCandidateTrialAttempt => Volatile.Read(ref _singleCandidateTrialAttempted) != 0;
 
     public void Dispose() => DriveService.Dispose();
 }

@@ -25,14 +25,21 @@ public sealed class PagedGroupCleanupConfirmationForm : Form
         Text = string.Empty
     };
 
-    public PagedGroupCleanupConfirmationForm(PagedGroupCleanupPlan plan, bool offlineSimulation)
+    public PagedGroupCleanupConfirmationForm(
+        PagedGroupCleanupPlan plan,
+        bool offlineSimulation,
+        bool singleCandidateTrial = false)
     {
         ArgumentNullException.ThrowIfNull(plan);
         Text = offlineSimulation
             ? "Confirmación explícita — simulación local"
-            : "Confirmación final — ejecución paginada bloqueada";
+            : singleCandidateTrial
+                ? "Confirmación final — prueba limitada a un candidato"
+                : "Confirmación final — ejecución paginada bloqueada";
         _confirm.Text = offlineSimulation
             ? "Confirmar simulación offline"
+            : singleCandidateTrial
+                ? "Confirmar un único candidato"
             : "Confirmar revisión (la escritura está bloqueada)";
         StartPosition = FormStartPosition.CenterParent;
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -48,7 +55,9 @@ public sealed class PagedGroupCleanupConfirmationForm : Form
             Font = new Font(SystemFonts.MessageBoxFont ?? SystemFonts.DefaultFont, FontStyle.Bold),
             Text = offlineSimulation
                 ? "MODO DEMOSTRACIÓN. Confirmar ejecutará el coordinador únicamente contra un transporte HTTP local en memoria. No se iniciará OAuth, no se accederá a Google Drive y no se modificará ningún archivo real."
-                : "EJECUCIÓN REAL DESHABILITADA EN ESTA VERSIÓN. Esta revisión final puede continuar la revalidación, pero el coordinador rechazará toda sesión real antes de iniciar una escritura. No se enviará ningún archivo a la papelera."
+                : singleCandidateTrial
+                    ? $"PRUEBA LIMITADA: exactamente un candidato, tamaño máximo {PagedGroupCleanupService.SingleCandidateTrialMaximumBytes:N0} bytes y todos los Keep identificados. Se requiere autorización de escritura y confirmación final."
+                    : "EJECUCIÓN REAL DESHABILITADA EN ESTA VERSIÓN. Esta revisión final puede continuar la revalidación, pero el coordinador rechazará toda sesión real antes de iniciar una escritura. No se enviará ningún archivo a la papelera."
         };
         var identity = new Label
         {
