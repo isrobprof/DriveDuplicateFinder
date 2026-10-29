@@ -393,7 +393,7 @@ public static class RecoverableFullScanLocalChecks
             Assert(mismatchRejected && sourceMustNotRun.RequestCount == 0, "Se permitió reanudar con otra cuenta o alcance.");
 
             IReadOnlyList<int> versions = await ReadMigrationVersionsAsync(factory, cancellationToken);
-            Assert(versions.SequenceEqual([1, 2, 3, 4]), "Las migraciones 1 a 3 no se conservaron junto a la migración 4.");
+            Assert(versions.SequenceEqual([1, 2, 3, 4, 5]), "Las migraciones 1 a 4 no se conservaron junto a la migración 5.");
             result = new RecoverableFullScanCheckResult(
                 temp, false, true, true, midPageRollback, true, invalidTokenDetected, true,
                 unclassifiedApiErrorRemainsResumable, mismatchRejected,

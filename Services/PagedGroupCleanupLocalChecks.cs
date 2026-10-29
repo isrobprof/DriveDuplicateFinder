@@ -54,9 +54,26 @@ public sealed record PagedGroupCleanupLocalCheckResult(
     bool TrialAccountScopeScanAndDecisionChangesRejectedBeforePatch,
     bool TrialPreflightStaleRejectedBeforePatch,
     bool TrialUncertainWriteUsesOneAttempt,
+    bool TrialPersistentPermitExactBindingAccepted,
+    bool TrialPersistentPermitRejectsIdentityAndCandidateMismatches,
+    bool TrialPersistentPermitSurvivesRestartAndIsSingleUse,
+    bool TrialPersistentPermitConcurrentConsumersHaveOneWinner,
+    bool TrialPersistentPermitMissingOrCorruptFailsClosed,
+    bool TrialPersistentPermitBurnedAfterDefinitiveWriteFailure,
+    bool TrialPersistentPermitBurnedAfterInterruption,
+    bool TrialPersistentPermitHasNoOperationalIssuer,
     bool TrialRealSessionRejectedWhileDisabled,
     bool RealExecutionBlockedAtCoordinator,
     bool PagedOutcomesAreSeparated);
+
+internal sealed record TrialAuthorizationLocalCheckResult(
+    bool ExactBindingAccepted,
+    bool IdentityAndCandidateMismatchesRejected,
+    bool RestartPersistsSingleUse,
+    bool ConcurrentSingleWinner,
+    bool MissingOrCorruptFailsClosed,
+    bool BurnedAfterInterruption,
+    bool NoOperationalIssuer);
 
 /// <summary>Deterministic coordinator and write-outcome checks using temporary SQLite and a local HTTP handler.</summary>
 public static class PagedGroupCleanupLocalChecks
@@ -173,10 +190,12 @@ public static class PagedGroupCleanupLocalChecks
         bool trialKeepsAndUndecidedProtected = false;
         bool trialSessionAuthorizationIsSingleUse = false;
         bool trialConfirmationRequiresExplicitAcceptance = TrialConfirmationRequiresExplicitAcceptance();
+        TrialAuthorizationLocalCheckResult permitChecks = await VerifyPersistentTrialAuthorizationAsync(cancellationToken);
         await using (TestFixture fixture = await TestFixture.CreateAsync(
                          FixtureKind.SingleCandidateWithUndecided, cancellationToken,
                          groupSize: PagedGroupCleanupService.SingleCandidateTrialMaximumBytes))
         {
+            PagedCleanupTrialAuthorization permit = await fixture.SeedTrialPermitAsync(cancellationToken);
             using CleanupDriveSession cleanup = fixture.CreateCleanupSession(Email, WriteBehavior.Success);
             PagedGroupCleanupPlan plan = await fixture.PreparePlanAsync(cleanup, cancellationToken, singleCandidateTrial: true);
             PagedGroupCleanupPlan secondPlan = await fixture.PreparePlanAsync(cleanup, cancellationToken, singleCandidateTrial: true);
@@ -191,6 +210,8 @@ public static class PagedGroupCleanupLocalChecks
             CleanupOperationResult result = await fixture.Coordinator.ExecuteConfirmedAsync(
                 cleanup, confirmation, cancellationToken: cancellationToken);
             bool authorizationConsumed = cleanup.HasUsedSingleCandidateTrialAttempt;
+            var reopenedReviews = new ReviewStateRepository(new SqliteConnectionFactory(new LocalDataPathService(fixture.RootPath)));
+            authorizationConsumed &= !await reopenedReviews.TryConsumePagedCleanupTrialAuthorizationAsync(permit, cancellationToken);
             string[] patchIds = fixture.TransportFor(cleanup).Requests.Where(request => request.Method == HttpMethod.Patch)
                 .Select(request => request.FileId!).ToArray();
             trialSingleCandidateAtLimitExecutedOnePatch = wrongCandidateRejected && patchIds.SequenceEqual(
@@ -265,6 +286,7 @@ public static class PagedGroupCleanupLocalChecks
         bool trialUncertainWriteUsesOneAttempt = false;
         await using (TestFixture fixture = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken))
         {
+            PagedCleanupTrialAuthorization permit = await fixture.SeedTrialPermitAsync(cancellationToken);
             using CleanupDriveSession cleanup = fixture.CreateCleanupSession(Email, WriteBehavior.LoseResponseAfterApply);
             PagedGroupCleanupPlan plan = await fixture.PreparePlanAsync(cleanup, cancellationToken, singleCandidateTrial: true);
             CleanupOperationResult result = await fixture.Coordinator.ExecuteConfirmedAsync(
@@ -284,11 +306,26 @@ public static class PagedGroupCleanupLocalChecks
                 result.Record.FileResults.Count == 1 && result.Record.FileResults[0].Status == CleanupFileStatus.Failed &&
                 result.Record.FileResults[0].FailureReason == "OutcomeUncertain" &&
                 result.Record.FileResults[0].FailureStage == "Files.UpdateOutcomeUncertain";
+            trialUncertainWriteUsesOneAttempt &= !await fixture.Reviews.TryConsumePagedCleanupTrialAuthorizationAsync(permit, cancellationToken);
         }
 
         bool trialIdentityAndDecisionChangesRejected = accountChange && scopeChange && scanChange && invalidSession && groupIdentityChange &&
             keepToCandidate && candidateToKeep && candidateToUndecided;
         bool trialStalePreflightRejected = stalePreflightRejected && approvedPreflightStaleBeforeExecution;
+
+        bool trialPermitBurnedAfterDefinitiveWriteFailure = false;
+        await using (TestFixture fixture = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken))
+        {
+            PagedCleanupTrialAuthorization permit = await fixture.SeedTrialPermitAsync(cancellationToken);
+            using CleanupDriveSession cleanup = fixture.CreateCleanupSession(Email, WriteBehavior.FailBeforeApply);
+            PagedGroupCleanupPlan plan = await fixture.PreparePlanAsync(cleanup, cancellationToken, singleCandidateTrial: true);
+            CleanupOperationResult result = await fixture.Coordinator.ExecuteConfirmedAsync(cleanup, fixture.Confirm(plan), cancellationToken: cancellationToken);
+            var reopened = new ReviewStateRepository(new SqliteConnectionFactory(new LocalDataPathService(fixture.RootPath)));
+            trialPermitBurnedAfterDefinitiveWriteFailure = result.Record.FileResults.Count == 1 &&
+                result.Record.FileResults[0].Status == CleanupFileStatus.Failed &&
+                fixture.TransportFor(cleanup).WriteAttempts == 1 &&
+                !await reopened.TryConsumePagedCleanupTrialAuthorizationAsync(permit, cancellationToken);
+        }
 
         bool singleCandidateSuccess = false;
         await using (TestFixture fixture = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken))
@@ -473,7 +510,12 @@ public static class PagedGroupCleanupLocalChecks
             trialRejectsMultipleCandidates, trialRejectsOversizedCandidate, trialRejectsUnknownCandidateSize,
             trialKeepsAndUndecidedProtected, trialSessionAuthorizationIsSingleUse,
             trialConfirmationRequiresExplicitAcceptance, trialIdentityAndDecisionChangesRejected,
-            trialStalePreflightRejected, trialUncertainWriteUsesOneAttempt, trialRealSessionRejectedWhileDisabled,
+            trialStalePreflightRejected, trialUncertainWriteUsesOneAttempt,
+            permitChecks.ExactBindingAccepted, permitChecks.IdentityAndCandidateMismatchesRejected,
+            permitChecks.RestartPersistsSingleUse, permitChecks.ConcurrentSingleWinner,
+            permitChecks.MissingOrCorruptFailsClosed, trialPermitBurnedAfterDefinitiveWriteFailure,
+            permitChecks.BurnedAfterInterruption,
+            permitChecks.NoOperationalIssuer, trialRealSessionRejectedWhileDisabled,
             realExecutionBlockedAtCoordinator,
             pagedOutcomesAreSeparated);
 
@@ -520,11 +562,209 @@ public static class PagedGroupCleanupLocalChecks
             "La modalidad limitada no rechazó cambios de cuenta, alcance, sesión, grupo o decisiones antes de PATCH.");
         Assert(checks.TrialPreflightStaleRejectedBeforePatch, "La modalidad limitada aceptó un preflight obsoleto.");
         Assert(checks.TrialUncertainWriteUsesOneAttempt, "Un resultado incierto de la prueba limitada se reintentó o se clasificó como confirmado.");
+        Assert(checks.TrialPersistentPermitExactBindingAccepted, "La autorización persistente no se consumió para su candidato, grupo e inventario exactos.");
+        Assert(checks.TrialPersistentPermitRejectsIdentityAndCandidateMismatches, "La autorización persistente aceptó otra cuenta, alcance, sesión, grupo o candidato.");
+        Assert(checks.TrialPersistentPermitSurvivesRestartAndIsSingleUse, "Una autorización consumida pudo recuperarse tras reabrir SQLite.");
+        Assert(checks.TrialPersistentPermitConcurrentConsumersHaveOneWinner, "Dos consumidores SQLite concurrentes adquirieron la misma autorización.");
+        Assert(checks.TrialPersistentPermitMissingOrCorruptFailsClosed, "La ausencia o corrupción de persistencia no falló cerrada antes de PATCH.");
+        Assert(checks.TrialPersistentPermitBurnedAfterDefinitiveWriteFailure, "Un fallo definitivo de escritura permitió reutilizar la autorización persistente.");
+        Assert(checks.TrialPersistentPermitBurnedAfterInterruption, "Una autorización consumida quedó reutilizable tras simular interrupción antes del PATCH.");
+        Assert(checks.TrialPersistentPermitHasNoOperationalIssuer, "La aplicación expone una ruta productiva de emisión del permiso de prueba.");
         Assert(checks.TrialRealSessionRejectedWhileDisabled, "Una sesión OAuth real atravesó el interruptor apagado de la modalidad limitada.");
         Assert(checks.RealExecutionBlockedAtCoordinator,
             "Una sesión real atravesó la guarda cerrada del coordinador o produjo efectos de limpieza.");
         Assert(checks.PagedOutcomesAreSeparated, "La pantalla de resultado paginado mezcla confirmados, pendientes, fallidos o inciertos.");
         return checks;
+    }
+
+    private static async Task<TrialAuthorizationLocalCheckResult> VerifyPersistentTrialAuthorizationAsync(
+        CancellationToken cancellationToken)
+    {
+        bool exactAccepted = false;
+        await using (TestFixture fixture = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken))
+        {
+            PagedCleanupTrialAuthorization permit = await fixture.SeedTrialPermitAsync(cancellationToken);
+            var reopened = new ReviewStateRepository(new SqliteConnectionFactory(new LocalDataPathService(fixture.RootPath)));
+            bool firstConsume = await reopened.TryConsumePagedCleanupTrialAuthorizationAsync(permit, cancellationToken);
+            bool secondConsumeRejected = !await reopened.TryConsumePagedCleanupTrialAuthorizationAsync(permit, cancellationToken);
+            bool directResetRejected = false;
+            await using (SqliteConnection connection = await fixture.Factory.OpenAsync(cancellationToken))
+            await using (SqliteCommand reset = connection.CreateCommand())
+            {
+                reset.CommandText = "UPDATE PagedCleanupTrialAuthorization SET State=1 WHERE Slot=1;";
+                try { await reset.ExecuteNonQueryAsync(cancellationToken); }
+                catch (SqliteException) { directResetRejected = true; }
+            }
+            exactAccepted = firstConsume && secondConsumeRejected && directResetRejected;
+        }
+
+        bool mismatchesRejected = true;
+        Func<PagedCleanupTrialAuthorization, PagedCleanupTrialAuthorization>[] mismatches =
+        [
+            value => value with { CandidateFileId = "another-candidate" },
+            value => value with { GroupId = "another-group" },
+            value => value with { AccountKey = "another-account" },
+            value => value with { ScopeKey = "another-scope" },
+            value => value with { ScanId = "another-scan" }
+        ];
+        foreach (Func<PagedCleanupTrialAuthorization, PagedCleanupTrialAuthorization> mismatch in mismatches)
+        {
+            await using TestFixture fixture = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken);
+            PagedCleanupTrialAuthorization valid = await fixture.GetTrialAuthorizationAsync(cancellationToken);
+            PagedCleanupTrialAuthorization forgedTarget = mismatch(valid) with { PermitId = "synthetic-permit" };
+            await SeedSyntheticAuthorizationAsync(fixture.Factory, forgedTarget, cancellationToken);
+            using CleanupDriveSession session = fixture.CreateCleanupSession(Email, WriteBehavior.Success);
+            PagedGroupCleanupPlan plan = await fixture.PreparePlanAsync(session, cancellationToken, singleCandidateTrial: true);
+            bool rejected = false;
+            try { _ = await fixture.Coordinator.ExecuteConfirmedAsync(session, fixture.Confirm(plan), cancellationToken: cancellationToken); }
+            catch (Exception exception) when (exception is InvalidOperationException or SqliteException) { rejected = true; }
+            mismatchesRejected &= rejected && fixture.TransportFor(session).Requests.All(request => request.Method != HttpMethod.Patch);
+        }
+        await using (TestFixture edited = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken))
+        {
+            _ = await edited.SeedTrialPermitAsync(cancellationToken);
+            using CleanupDriveSession session = edited.CreateCleanupSession(Email, WriteBehavior.Success);
+            PagedGroupCleanupPlan plan = await edited.PreparePlanAsync(session, cancellationToken, singleCandidateTrial: true);
+            PagedGroupCleanupConfirmation confirmation = edited.Confirm(plan);
+            await edited.Reviews.SetExplicitDecisionAsync(edited.Identity, "candidate-1", DuplicateFileDecision.Keep, cancellationToken);
+            bool rejected = false;
+            try { _ = await edited.Coordinator.ExecuteConfirmedAsync(session, confirmation, cancellationToken: cancellationToken); }
+            catch (InvalidOperationException) { rejected = true; }
+            mismatchesRejected &= rejected && edited.TransportFor(session).Requests.All(request => request.Method != HttpMethod.Patch);
+        }
+
+        // The authorization contract itself rejects multi-candidate, oversized, or Keep-less reviews.
+        await using (TestFixture multiple = await TestFixture.CreateAsync(FixtureKind.MultipleCandidates, cancellationToken))
+        {
+            PersistedCleanupGroupReview review = await multiple.Adapter.BuildAsync(multiple.Identity, cancellationToken);
+            string candidate = review.Review.DecisionsByFileId.First(pair => pair.Value == DuplicateFileDecision.CandidateForTrash).Key;
+            bool rejected = false;
+            try { _ = PagedGroupCleanupService.CreateTrialAuthorizationBinding(review, candidate, multiple.Identity.SizeBytes, "synthetic"); }
+            catch (InvalidOperationException) { rejected = true; }
+            mismatchesRejected &= rejected;
+        }
+        await using (TestFixture oversized = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken,
+                         groupSize: PagedGroupCleanupService.SingleCandidateTrialMaximumBytes + 1))
+        {
+            PersistedCleanupGroupReview review = await oversized.Adapter.BuildAsync(oversized.Identity, cancellationToken);
+            bool rejected = false;
+            try { _ = PagedGroupCleanupService.CreateTrialAuthorizationBinding(review, "candidate-1", oversized.Identity.SizeBytes, "synthetic"); }
+            catch (InvalidOperationException) { rejected = true; }
+            mismatchesRejected &= rejected;
+        }
+
+        bool restartSingleUse = false;
+        bool burnedAfterInterruption = false;
+        await using (TestFixture fixture = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken))
+        {
+            PagedCleanupTrialAuthorization permit = await fixture.SeedTrialPermitAsync(cancellationToken);
+            var reopened = new ReviewStateRepository(new SqliteConnectionFactory(new LocalDataPathService(fixture.RootPath)));
+            PagedCleanupTrialAuthorization? recovered = await reopened.GetAvailablePagedCleanupTrialAuthorizationAsync(
+                permit with { PermitId = "" }, cancellationToken);
+            bool consumed = recovered is not null && await reopened.TryConsumePagedCleanupTrialAuthorizationAsync(recovered, cancellationToken);
+            var afterRestart = new ReviewStateRepository(new SqliteConnectionFactory(new LocalDataPathService(fixture.RootPath)));
+            restartSingleUse = consumed && !await afterRestart.TryConsumePagedCleanupTrialAuthorizationAsync(permit, cancellationToken);
+
+            // Simulate process loss after the durable consume and before any PATCH was issued.
+            var interrupted = new ReviewStateRepository(new SqliteConnectionFactory(new LocalDataPathService(fixture.RootPath)));
+            burnedAfterInterruption = restartSingleUse &&
+                await interrupted.GetAvailablePagedCleanupTrialAuthorizationAsync(permit with { PermitId = "" }, cancellationToken) is null &&
+                fixture.TotalRemoteRequests == 0;
+        }
+
+        bool concurrentSingleWinner = false;
+        await using (TestFixture fixture = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken))
+        {
+            PagedCleanupTrialAuthorization permit = await fixture.SeedTrialPermitAsync(cancellationToken);
+            var first = new ReviewStateRepository(new SqliteConnectionFactory(new LocalDataPathService(fixture.RootPath)));
+            var second = new ReviewStateRepository(new SqliteConnectionFactory(new LocalDataPathService(fixture.RootPath)));
+            async Task<bool> ConsumeSafelyAsync(ReviewStateRepository repository)
+            {
+                try { return await repository.TryConsumePagedCleanupTrialAuthorizationAsync(permit, cancellationToken); }
+                catch (SqliteException) { return false; }
+            }
+            bool[] winners = await Task.WhenAll(ConsumeSafelyAsync(first), ConsumeSafelyAsync(second));
+            concurrentSingleWinner = winners.Count(value => value) == 1;
+        }
+
+        bool missingOrCorruptFailsClosed = false;
+        await using (TestFixture missing = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken))
+        {
+            using CleanupDriveSession session = missing.CreateCleanupSession(Email, WriteBehavior.Success);
+            PagedGroupCleanupPlan plan = await missing.PreparePlanAsync(session, cancellationToken, singleCandidateTrial: true);
+            bool rejected = false;
+            try { _ = await missing.Coordinator.ExecuteConfirmedAsync(session, missing.Confirm(plan), cancellationToken: cancellationToken); }
+            catch (InvalidOperationException) { rejected = true; }
+            bool noPatch = missing.TransportFor(session).Requests.All(request => request.Method != HttpMethod.Patch);
+
+            await using (SqliteConnection connection = await missing.Factory.OpenAsync(cancellationToken))
+            await using (SqliteCommand drop = connection.CreateCommand())
+            {
+                drop.CommandText = "DROP TABLE PagedCleanupTrialAuthorization;";
+                await drop.ExecuteNonQueryAsync(cancellationToken);
+            }
+            // The table is already absent; a second independently prepared fixture checks schema loss before any PATCH.
+            missingOrCorruptFailsClosed = rejected && noPatch;
+        }
+        await using (TestFixture corrupt = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken))
+        {
+            using CleanupDriveSession session = corrupt.CreateCleanupSession(Email, WriteBehavior.Success);
+            PagedGroupCleanupPlan plan = await corrupt.PreparePlanAsync(session, cancellationToken, singleCandidateTrial: true);
+            await using (SqliteConnection connection = await corrupt.Factory.OpenAsync(cancellationToken))
+            await using (SqliteCommand drop = connection.CreateCommand())
+            {
+                drop.CommandText = "DROP TABLE PagedCleanupTrialAuthorization;";
+                await drop.ExecuteNonQueryAsync(cancellationToken);
+            }
+            bool rejected = false;
+            try { _ = await corrupt.Coordinator.ExecuteConfirmedAsync(session, corrupt.Confirm(plan), cancellationToken: cancellationToken); }
+            catch (SqliteException) { rejected = true; }
+            missingOrCorruptFailsClosed &= rejected && corrupt.TransportFor(session).Requests.All(request => request.Method != HttpMethod.Patch);
+        }
+
+        string coordinatorPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "Services", "PagedGroupCleanupService.cs"));
+        string formPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "Form1.cs"));
+        string programPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "Program.cs"));
+        string repositoryPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "Data", "Sqlite", "Repositories", "ReviewStateRepository.cs"));
+        bool noIssuer = File.Exists(coordinatorPath) && File.Exists(formPath) && File.Exists(programPath) && File.Exists(repositoryPath) &&
+            !File.ReadAllText(coordinatorPath).Contains("SET State=1", StringComparison.OrdinalIgnoreCase) &&
+            !File.ReadAllText(repositoryPath).Contains("SET State=1", StringComparison.OrdinalIgnoreCase) &&
+            !File.ReadAllText(formPath).Contains("IssuePagedCleanupTrialAuthorization", StringComparison.Ordinal) &&
+            !File.ReadAllText(programPath).Contains("IssuePagedCleanupTrialAuthorization", StringComparison.Ordinal);
+
+        return new TrialAuthorizationLocalCheckResult(exactAccepted, mismatchesRejected, restartSingleUse,
+            concurrentSingleWinner, missingOrCorruptFailsClosed, burnedAfterInterruption, noIssuer);
+    }
+
+    private static async Task SeedSyntheticAuthorizationAsync(
+        SqliteConnectionFactory factory,
+        PagedCleanupTrialAuthorization authorization,
+        CancellationToken cancellationToken)
+    {
+        await using SqliteConnection connection = await factory.OpenAsync(cancellationToken);
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE PagedCleanupTrialAuthorization
+            SET State=1, PermitId=$permitId, AccountKey=$accountKey, ScopeKey=$scopeKey, ScanId=$scanId,
+                GroupId=$groupId, GroupSizeBytes=$groupSize, NormalizedChecksum=$checksum,
+                CandidateFileId=$candidateId, CandidateSizeBytes=$candidateSize, ConfirmedAtUtc=$confirmed,
+                KeepSetSha256=$keepHash, IssuedAtUtc=$issued
+            WHERE Slot=1 AND State=0;
+            """;
+        command.Parameters.AddWithValue("$permitId", authorization.PermitId);
+        command.Parameters.AddWithValue("$accountKey", authorization.AccountKey);
+        command.Parameters.AddWithValue("$scopeKey", authorization.ScopeKey);
+        command.Parameters.AddWithValue("$scanId", authorization.ScanId);
+        command.Parameters.AddWithValue("$groupId", authorization.GroupId);
+        command.Parameters.AddWithValue("$groupSize", authorization.GroupSizeBytes);
+        command.Parameters.AddWithValue("$checksum", authorization.NormalizedChecksum);
+        command.Parameters.AddWithValue("$candidateId", authorization.CandidateFileId);
+        command.Parameters.AddWithValue("$candidateSize", authorization.CandidateSizeBytes);
+        command.Parameters.AddWithValue("$confirmed", SqlitePersistenceFormat.ToUtcText(authorization.ConfirmedAtUtc));
+        command.Parameters.AddWithValue("$keepHash", authorization.KeepSetSha256);
+        command.Parameters.AddWithValue("$issued", SqlitePersistenceFormat.ToUtcText(DateTimeOffset.UtcNow));
+        if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)
+            throw new InvalidOperationException("El fixture no pudo sembrar la autorización sintética en su slot SQLite temporal.");
     }
 
     private static CleanupFileResult Outcome(
@@ -759,7 +999,7 @@ public static class PagedGroupCleanupLocalChecks
     }
 
     private enum FixtureKind { Standard, TwoKeeps, MultipleCandidates, CrossPageDecisions, SingleCandidateWithUndecided }
-    private enum WriteBehavior { None, Success, FailSecondBeforeApply, LoseSecondResponseAfterApply, LoseResponseAfterApply }
+    private enum WriteBehavior { None, Success, FailBeforeApply, FailSecondBeforeApply, LoseSecondResponseAfterApply, LoseResponseAfterApply }
     private sealed record CapturedRequest(HttpMethod Method, string? FileId);
 
     private sealed class TestFixture : IAsyncDisposable
@@ -857,6 +1097,21 @@ public static class PagedGroupCleanupLocalChecks
 
         public PagedGroupCleanupConfirmation Confirm(PagedGroupCleanupPlan plan) => Coordinator.ConfirmPlan(
             plan, plan.KeepFiles.Select(file => file.Id), plan.CandidateFiles.Select(file => file.Id));
+
+        public async Task<PagedCleanupTrialAuthorization> GetTrialAuthorizationAsync(CancellationToken token)
+        {
+            PersistedCleanupGroupReview review = await Adapter.BuildAsync(Identity, token);
+            string candidateId = review.Review.DecisionsByFileId
+                .Single(pair => pair.Value == DuplicateFileDecision.CandidateForTrash).Key;
+            return PagedGroupCleanupService.CreateTrialAuthorizationBinding(review, candidateId, _groupSize, "synthetic-permit-" + Guid.NewGuid().ToString("N"));
+        }
+
+        public async Task<PagedCleanupTrialAuthorization> SeedTrialPermitAsync(CancellationToken token)
+        {
+            PagedCleanupTrialAuthorization authorization = await GetTrialAuthorizationAsync(token);
+            await SeedSyntheticAuthorizationAsync(Factory, authorization, token);
+            return authorization;
+        }
 
         public async Task ChangeSessionFieldAsync(string field, string value, CancellationToken token)
         {
@@ -987,6 +1242,8 @@ public static class PagedGroupCleanupLocalChecks
                 WriteAttempts++;
                 if (_behavior == WriteBehavior.None)
                     return Task.FromResult(Json(HttpStatusCode.MethodNotAllowed, Error("Unexpected write.")));
+                if (_behavior == WriteBehavior.FailBeforeApply && id == "candidate-1")
+                    return Task.FromResult(Json(HttpStatusCode.InternalServerError, Error("Synthetic failure before apply.")));
                 if (_behavior == WriteBehavior.FailSecondBeforeApply && id == "candidate-2")
                     return Task.FromResult(Json(HttpStatusCode.InternalServerError, Error("Synthetic failure before apply.")));
                 _trashed.Add(id!);

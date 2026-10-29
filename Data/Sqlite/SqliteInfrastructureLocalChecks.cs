@@ -33,7 +33,7 @@ public static class SqliteInfrastructureLocalChecks
         "DriveFiles", "ScanSessions", "ScanCheckpoints", "DriveChangeState",
         "ExactDuplicateGroups", "ExactDuplicateMembers",
         "PossibleDuplicateGroups", "PossibleDuplicateMembers",
-        "ReviewInventories", "ReviewGroupStates", "ReviewFileDecisions"
+        "ReviewInventories", "ReviewGroupStates", "ReviewFileDecisions", "PagedCleanupTrialAuthorization"
     ];
 
     private static readonly string[] ExpectedIndexes =
@@ -69,7 +69,7 @@ public static class SqliteInfrastructureLocalChecks
             await initializer.InitializeAsync(cancellationToken);
             await initializer.InitializeAsync(cancellationToken);
             SchemaSnapshot schema = await GetSchemaSnapshotAsync(factory, cancellationToken);
-            Assert(schema.MigrationVersions.SequenceEqual([1, 2, 3, 4]), "Las migraciones 1 a 4 no se registraron exactamente una vez.");
+            Assert(schema.MigrationVersions.SequenceEqual([1, 2, 3, 4, 5]), "Las migraciones 1 a 5 no se registraron exactamente una vez.");
             Assert(schema.Tables.SequenceEqual(ExpectedTables.OrderBy(name => name, StringComparer.Ordinal), StringComparer.Ordinal), "Las tablas de las migraciones aplicadas no coinciden.");
             Assert(schema.Indexes.SequenceEqual(ExpectedIndexes.OrderBy(name => name, StringComparer.Ordinal), StringComparer.Ordinal), "Los índices de las migraciones aplicadas no coinciden.");
             Assert(schema.ForeignKeys == 1, "PRAGMA foreign_keys debe ser 1.");
@@ -91,7 +91,7 @@ public static class SqliteInfrastructureLocalChecks
 
             await initializer.InitializeAsync(cancellationToken);
             Assert(await files.CountAsync(cancellationToken) == 1, "La inicialización idempotente no debe borrar datos existentes.");
-            Assert((await GetSchemaSnapshotAsync(factory, cancellationToken)).MigrationVersions.SequenceEqual([1, 2, 3, 4]), "La inicialización idempotente duplicó una migración.");
+            Assert((await GetSchemaSnapshotAsync(factory, cancellationToken)).MigrationVersions.SequenceEqual([1, 2, 3, 4, 5]), "La inicialización idempotente duplicó una migración.");
 
             await VerifyIncompleteSessionsAsync(sessions, now, cancellationToken);
 

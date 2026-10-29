@@ -11,7 +11,7 @@ namespace DriveDuplicateFinder.Data.Sqlite;
 public sealed record ReviewStatePersistenceCheckResult(
     string TemporaryDirectory,
     bool TemporaryDirectoryDeleted,
-    bool MigrationsOneThroughFourAppliedIdempotently,
+    bool MigrationsOneThroughFiveAppliedIdempotently,
     bool PagedReviewWorkflowVerified,
     bool PagedCleanupPlanVerified,
     bool DecisionLifecyclePreserved,
@@ -45,8 +45,8 @@ public static class ReviewStatePersistenceLocalChecks
             var repository = new ReviewStateRepository(factory);
 
             IReadOnlyList<int> versions = await ReadMigrationVersionsAsync(factory, cancellationToken);
-            bool migrationsOneThroughFourAppliedIdempotently = versions.SequenceEqual([1, 2, 3, 4]);
-            Assert(migrationsOneThroughFourAppliedIdempotently, "Las migraciones SQLite 1 a 4 no se aplicaron una sola vez.");
+            bool migrationsOneThroughFiveAppliedIdempotently = versions.SequenceEqual([1, 2, 3, 4, 5]);
+            Assert(migrationsOneThroughFiveAppliedIdempotently, "Las migraciones SQLite 1 a 5 no se aplicaron una sola vez.");
 
             var scope = new ScanInventoryIdentity("review-account", "review-scope", "review-current");
             var oldInventory = new ScanInventoryIdentity(scope.AccountKey, scope.ScopeKey, "review-old");
@@ -343,7 +343,7 @@ public static class ReviewStatePersistenceLocalChecks
             Assert(reopenedDatabasePreservedState, "La selección/estado no sobrevivió al reopen o el JSON heredado cambió.");
 
             result = new ReviewStatePersistenceCheckResult(
-                root, false, migrationsOneThroughFourAppliedIdempotently, pagedReviewWorkflowVerified,
+                root, false, migrationsOneThroughFiveAppliedIdempotently, pagedReviewWorkflowVerified,
                 pagedCleanupPlanVerified,
                 ready.Status == DuplicateGroupReviewStatus.ReadyForCleanup && reviewed.Status == DuplicateGroupReviewStatus.ReviewedWithoutCleanup,
                 selectedPageValid && deselectedPageValid,

@@ -20,6 +20,72 @@ public sealed class ReviewStateRepository
         _files = new DriveFileCacheRepository(connectionFactory);
     }
 
+    /// <summary>Read-only gate used before invalidating the inventory or creating a pending operation.</summary>
+    internal async Task<PagedCleanupTrialAuthorization?> GetAvailablePagedCleanupTrialAuthorizationAsync(
+        PagedCleanupTrialAuthorization expected,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        await using SqliteConnection connection = await _connectionFactory.OpenAsync(cancellationToken);
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = $"SELECT PermitId FROM PagedCleanupTrialAuthorization WHERE {TrialAuthorizationTargetPredicate};";
+        AddTrialAuthorizationParameters(command, expected);
+        object? permitId = await command.ExecuteScalarAsync(cancellationToken);
+        return permitId is string value ? expected with { PermitId = value } : null;
+    }
+
+    /// <summary>
+    /// Atomically consumes the one persistent trial slot. A successful transition is irreversible;
+    /// even cancellation or process loss immediately afterwards leaves it consumed.
+    /// </summary>
+    internal async Task<bool> TryConsumePagedCleanupTrialAuthorizationAsync(
+        PagedCleanupTrialAuthorization authorization,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(authorization);
+        await using SqliteConnection connection = await _connectionFactory.OpenAsync(cancellationToken);
+        await using SqliteTransaction transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"UPDATE PagedCleanupTrialAuthorization SET State=2, ConsumedAtUtc=$consumedAtUtc WHERE {TrialAuthorizationMatchPredicate};";
+        AddTrialAuthorizationParameters(command, authorization);
+        command.Parameters.AddWithValue("$consumedAtUtc", SqlitePersistenceFormat.ToUtcText(DateTimeOffset.UtcNow));
+        int changed = await command.ExecuteNonQueryAsync(cancellationToken);
+        if (changed == 1)
+            await transaction.CommitAsync(cancellationToken);
+        else
+            await transaction.RollbackAsync(cancellationToken);
+        return changed == 1;
+    }
+
+    private const string TrialAuthorizationMatchPredicate = """
+        Slot=1 AND State=1 AND PermitId=$permitId AND AccountKey=$accountKey AND ScopeKey=$scopeKey AND ScanId=$scanId
+        AND GroupId=$groupId AND GroupSizeBytes=$groupSizeBytes AND NormalizedChecksum=$checksum COLLATE BINARY
+        AND CandidateFileId=$candidateFileId AND CandidateSizeBytes=$candidateSizeBytes
+        AND ConfirmedAtUtc=$confirmedAtUtc AND KeepSetSha256=$keepSetSha256 COLLATE BINARY
+        """;
+    private const string TrialAuthorizationTargetPredicate = """
+        Slot=1 AND State=1 AND AccountKey=$accountKey AND ScopeKey=$scopeKey AND ScanId=$scanId
+        AND GroupId=$groupId AND GroupSizeBytes=$groupSizeBytes AND NormalizedChecksum=$checksum COLLATE BINARY
+        AND CandidateFileId=$candidateFileId AND CandidateSizeBytes=$candidateSizeBytes
+        AND ConfirmedAtUtc=$confirmedAtUtc AND KeepSetSha256=$keepSetSha256 COLLATE BINARY
+        """;
+
+    private static void AddTrialAuthorizationParameters(SqliteCommand command, PagedCleanupTrialAuthorization authorization)
+    {
+        command.Parameters.AddWithValue("$permitId", authorization.PermitId);
+        command.Parameters.AddWithValue("$accountKey", authorization.AccountKey);
+        command.Parameters.AddWithValue("$scopeKey", authorization.ScopeKey);
+        command.Parameters.AddWithValue("$scanId", authorization.ScanId);
+        command.Parameters.AddWithValue("$groupId", authorization.GroupId);
+        command.Parameters.AddWithValue("$groupSizeBytes", authorization.GroupSizeBytes);
+        command.Parameters.AddWithValue("$checksum", authorization.NormalizedChecksum);
+        command.Parameters.AddWithValue("$candidateFileId", authorization.CandidateFileId);
+        command.Parameters.AddWithValue("$candidateSizeBytes", authorization.CandidateSizeBytes);
+        command.Parameters.AddWithValue("$confirmedAtUtc", SqlitePersistenceFormat.ToUtcText(authorization.ConfirmedAtUtc));
+        command.Parameters.AddWithValue("$keepSetSha256", authorization.KeepSetSha256);
+    }
+
     public async Task RegisterCompletedInventoryAsync(
         ScanInventoryIdentity inventory,
         CancellationToken cancellationToken = default)

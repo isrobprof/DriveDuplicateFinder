@@ -229,6 +229,18 @@ public sealed class PagedGroupCleanupService
         if (confirmation.IsSingleCandidateTrial && lastPreflight.CandidateFiles.Count != 1)
             throw new InvalidOperationException("La modalidad de prueba exige exactamente un candidato en el último control previo a escritura.");
 
+        PagedCleanupTrialAuthorization? trialAuthorization = null;
+        if (confirmation.IsSingleCandidateTrial)
+        {
+            CleanupFileSnapshot candidate = lastPreflight.CandidateFiles.Single();
+            PagedCleanupTrialAuthorization expectedAuthorization = CreateTrialAuthorizationBinding(
+                finalLocal, candidate.Id, candidate.Size ?? throw new InvalidOperationException(
+                    "El tamaño del candidato debe seguir siendo conocido al vincular la autorización persistente."));
+            trialAuthorization = await _reviews.GetAvailablePagedCleanupTrialAuthorizationAsync(expectedAuthorization, cancellationToken);
+            if (trialAuthorization is null)
+                throw new InvalidOperationException("No existe una autorización persistente de prueba vigente para esta cuenta, sesión, grupo y candidato.");
+        }
+
         // One OAuth cleanup session may make at most one write attempt in the limited trial flow.
         if (confirmation.IsSingleCandidateTrial && !cleanupSession.TryBeginSingleCandidateTrialAttempt())
             throw new InvalidOperationException("La autorización de prueba de un candidato ya fue consumida; inicia una nueva revisión y autorización.");
@@ -243,6 +255,11 @@ public sealed class PagedGroupCleanupService
             EnsureSingleCandidateTrialIsValid(finalLocal, lastPreflight);
             if (lastPreflight.CandidateFiles.Count != 1)
                 throw new InvalidOperationException("La modalidad de prueba exige un único candidato antes de enviar a la papelera.");
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (trialAuthorization is null ||
+                !await _reviews.TryConsumePagedCleanupTrialAuthorizationAsync(trialAuthorization, CancellationToken.None))
+                throw new InvalidOperationException("La autorización persistente ya fue consumida, cambió o no pudo vincularse exactamente; no se ejecutó ninguna escritura.");
         }
 
         // This is the existing Files.Update(Trashed=true) path. It receives only the
@@ -252,6 +269,34 @@ public sealed class PagedGroupCleanupService
         cleanupSession.DriveService.HttpClient.MessageHandler.NumTries = 1;
         return await _trash.ExecuteAsync(cleanupSession.DriveService, lastPreflight, _history, history,
             progress, cancellationToken, stopAfterCurrentFileRequested);
+    }
+
+    internal static PagedCleanupTrialAuthorization CreateTrialAuthorizationBinding(
+        PersistedCleanupGroupReview review,
+        string candidateFileId,
+        long candidateSizeBytes,
+        string permitId = "")
+    {
+        ArgumentNullException.ThrowIfNull(review);
+        ArgumentException.ThrowIfNullOrWhiteSpace(candidateFileId);
+        DuplicateGroupIdentity identity = review.Identity;
+        if (review.MemberCount > PersistedCleanupGroupReviewAdapter.MaximumMembersPerGroup ||
+            review.Review.DecisionsByFileId.Count != review.MemberCount ||
+            review.Review.DecisionsByFileId.Values.Count(value => value == DuplicateFileDecision.Keep) < 1 ||
+            review.Review.DecisionsByFileId.Values.Count(value => value == DuplicateFileDecision.CandidateForTrash) != 1 ||
+            review.Review.DecisionsByFileId.Values.Any(value => value is not DuplicateFileDecision.Keep and
+                not DuplicateFileDecision.CandidateForTrash and not DuplicateFileDecision.Undecided) ||
+            !review.Review.DecisionsByFileId.TryGetValue(candidateFileId, out DuplicateFileDecision decision) ||
+            decision != DuplicateFileDecision.CandidateForTrash || candidateSizeBytes != identity.SizeBytes ||
+            candidateSizeBytes > SingleCandidateTrialMaximumBytes)
+            throw new InvalidOperationException("La autorización requiere una revisión confirmada con un Keep y exactamente un candidato pequeño.");
+
+        string[] keepIds = review.Review.DecisionsByFileId.Where(pair => pair.Value == DuplicateFileDecision.Keep)
+            .Select(pair => pair.Key).OrderBy(id => id, StringComparer.Ordinal).ToArray();
+        return new PagedCleanupTrialAuthorization(permitId, identity.Inventory.AccountKey, identity.Inventory.ScopeKey,
+            identity.Inventory.ScanId, review.Review.StableId, identity.SizeBytes, identity.NormalizedChecksum,
+            candidateFileId, candidateSizeBytes, review.ConfirmedAtUtc,
+            PagedCleanupTrialAuthorization.ComputeKeepSetSha256(keepIds));
     }
 
     private async Task EnsureIdentityAsync(DriveService drive, ScanInventoryIdentity expected, CancellationToken token)

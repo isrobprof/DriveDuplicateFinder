@@ -15,7 +15,8 @@ public sealed class SqliteDatabaseInitializer
                 new Migration001InitialScanCache(),
                 new Migration002RecoverableFullScans(),
                 new Migration003ReviewPersistence(),
-                new Migration004ExplicitReviewConfirmation()
+                new Migration004ExplicitReviewConfirmation(),
+                new Migration005SingleUsePagedCleanupAuthorization()
             ])
             .OrderBy(migration => migration.Version)
             .ToArray();
