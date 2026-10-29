@@ -33,13 +33,14 @@ public partial class Form1 : Form
     private readonly ReviewStateStorageService _reviewStateStorageService = new();
     private readonly GoogleDriveTrashService _trashService = new();
     private readonly CleanupBatchService _cleanupBatchService;
-    private readonly CleanupHistoryService _cleanupHistoryService = new();
+    private readonly CleanupHistoryService _cleanupHistoryService;
     private readonly List<DuplicateGroupReview> _reviews = [];
     private readonly BindingList<ReviewGroupRow> _mainGridRows = [];
     private readonly Dictionary<string, KeepRecommendation> _recommendationsByGroupId = new(StringComparer.Ordinal);
     private readonly RecommendationUndoSession _recommendationUndoSession = new();
     private readonly RecommendationBatchUndoSession _recommendationBatchUndoSession = new();
     private readonly PagedRequestGeneration _pagedRequestGeneration = new();
+    private DemoPagedCleanupSimulationService? _demoPagedCleanupSimulationService;
     private readonly HashSet<string> _batchSelectedStableIds = new(StringComparer.Ordinal);
     private readonly ToolTip _recommendationToolTip = new();
     private readonly System.Windows.Forms.Timer _reviewSaveTimer = new() { Interval = 1500 };
@@ -79,6 +80,8 @@ public partial class Form1 : Form
     private bool _pagedReviewWriteInProgress;
     private bool _pagedPreflightInProgress;
     private bool _pagedLocalPlanPreparationInProgress;
+    private bool _pagedCleanupSimulationInProgress;
+    private bool _pagedCleanupSimulationCompleted;
     private bool _pagedGroupReviewConfirmed;
 
     private readonly GroupBox grpFiltros = new();
@@ -138,6 +141,7 @@ public partial class Form1 : Form
     private readonly Button btnPagedSkipGroup = new();
     private readonly Button btnPagedViewCleanupPlan = new();
     private readonly Button btnPagedPrepareGroupPlan = new();
+    private readonly Button btnPagedSimulateCleanup = new();
     private readonly Button btnPagedCheckDrive = new();
     private readonly Button btnReopenLatestScan = new();
     private const int PagedGroupPageSize = 1;
@@ -150,6 +154,9 @@ public partial class Form1 : Form
         WinFormsStartupLocalChecks.EnsureStaThread();
         _demoMode = demoMode;
         _demoDataDirectory = demoMode ? DemoReviewData.CreateTemporaryDirectoryPath() : null;
+        _cleanupHistoryService = new CleanupHistoryService(_demoDataDirectory is null
+            ? null
+            : Path.Combine(_demoDataDirectory, "cleanup-history"));
         _recoverableFullScanService = new RecoverableFullScanService(_fileService, _demoDataDirectory);
         var connectionFactory = new SqliteConnectionFactory(new LocalDataPathService(_demoDataDirectory));
         _reviewStateRepository = new ReviewStateRepository(connectionFactory);
@@ -175,8 +182,8 @@ public partial class Form1 : Form
             btnReopenLatestScan.Enabled = false;
             chkLegacyFullScan.Enabled = false;
             lblTitulo.Text = "MODO DEMOSTRACIÓN — Drive Duplicate Finder";
-            lblDescripcion.Text = "Datos ficticios en SQLite temporal. Sin OAuth, escaneo remoto, preflight ni limpieza real.";
-            lblPagedReadOnly.Text = "MODO DEMOSTRACIÓN — decisiones únicamente locales; ningún cambio se enviará a Google Drive.";
+            lblDescripcion.Text = "Datos ficticios en SQLite temporal. El flujo completo solo usa transporte simulado local; sin OAuth ni acceso a Google Drive.";
+            lblPagedReadOnly.Text = "MODO DEMOSTRACIÓN — decisiones locales. La simulación usa un transporte en memoria; no se conecta a Google Drive.";
             Text = "DriveDuplicateFinder — MODO DEMOSTRACIÓN";
         }
     }
@@ -673,6 +680,8 @@ public partial class Form1 : Form
         try
         {
             _demoSeed = await DemoReviewData.CreateAsync(_demoDataDirectory);
+            _demoPagedCleanupSimulationService = new DemoPagedCleanupSimulationService(
+                _demoSeed, _pagedGroupPreflightService, _pagedGroupCleanupService);
             RecoverableFullScanResult result = await _recoverableFullScanService.OpenCompletedInventoryAsync(_demoSeed.Inventory);
             ActivatePagedInventory(result);
             SetPagedReadOnlyMode(true);
@@ -757,10 +766,12 @@ public partial class Form1 : Form
         ConfigureButton(btnPagedSkipGroup, "Saltar grupo", btnPagedSkipGroup_Click);
         ConfigureButton(btnPagedViewCleanupPlan, "Plan de todos los grupos", btnPagedViewCleanupPlan_Click);
         ConfigureButton(btnPagedPrepareGroupPlan, "Preparar plan del grupo (solo local)", btnPagedPrepareGroupPlan_Click);
+        ConfigureButton(btnPagedSimulateCleanup, "Simular flujo completo (solo demo)", btnPagedSimulateCleanup_Click);
+        btnPagedSimulateCleanup.Visible = _demoMode;
         ConfigureButton(btnPagedCheckDrive, "Comprobar en Google Drive", btnPagedCheckDrive_Click);
         lblPagedMembersPage.AutoSize = true;
         lblPagedMembersPage.Padding = new Padding(4, 6, 0, 0);
-        memberNavigation.Controls.AddRange([btnPagedPreviousMemberPage, btnPagedNextMemberPage, btnPagedConfirmGroup, btnPagedSkipGroup, btnPagedPrepareGroupPlan, btnPagedViewCleanupPlan, btnPagedCheckDrive, lblPagedMembersPage]);
+        memberNavigation.Controls.AddRange([btnPagedPreviousMemberPage, btnPagedNextMemberPage, btnPagedConfirmGroup, btnPagedSkipGroup, btnPagedPrepareGroupPlan, btnPagedSimulateCleanup, btnPagedViewCleanupPlan, btnPagedCheckDrive, lblPagedMembersPage]);
         var reviewNotice = new Label
         {
             AutoSize = true,
@@ -1058,25 +1069,32 @@ public partial class Form1 : Form
         string range = groupCount == 0 ? "No hay grupos" : $"Grupo {groupNumber:N0} de {groupTotal:N0}";
         bool groupPageLoaded = _pagedGroupPage is not null;
         lblPagedGroupPage.Text = _pagedReadOnlyMode ? range : string.Empty;
-        bool pagedBusy = _pagedReviewWriteInProgress || _pagedPreflightInProgress;
-        btnPagedPreviousGroupPage.Enabled = _pagedReadOnlyMode && !pagedBusy && groupPageLoaded && PagedReadOnlyViewSafety.HasPreviousPage(_pagedGroupOffset);
-        btnPagedNextGroupPage.Enabled = _pagedReadOnlyMode && !pagedBusy && groupPageLoaded &&
+        bool pagedBusy = _pagedReviewWriteInProgress || _pagedPreflightInProgress ||
+            _pagedLocalPlanPreparationInProgress || _pagedCleanupSimulationInProgress;
+        bool pagedCompleted = _pagedCleanupSimulationCompleted;
+        btnPagedPreviousGroupPage.Enabled = _pagedReadOnlyMode && !pagedBusy && !pagedCompleted && groupPageLoaded && PagedReadOnlyViewSafety.HasPreviousPage(_pagedGroupOffset);
+        btnPagedNextGroupPage.Enabled = _pagedReadOnlyMode && !pagedBusy && !pagedCompleted && groupPageLoaded &&
             PagedReadOnlyViewSafety.HasNextPage(_pagedGroupOffset, groupCount, groupTotal);
         bool hasMembers = _activePagedGroup is not null;
         dgvPagedGroups.Enabled = _pagedReadOnlyMode && !_pagedPreflightInProgress;
-        btnPagedPreviousMemberPage.Enabled = _pagedReadOnlyMode && !pagedBusy && hasMembers && _pagedMemberOffset > 0;
-        btnPagedNextMemberPage.Enabled = _pagedReadOnlyMode && !pagedBusy && hasMembers &&
+        btnPagedPreviousMemberPage.Enabled = _pagedReadOnlyMode && !pagedBusy && !pagedCompleted && hasMembers && _pagedMemberOffset > 0;
+        btnPagedNextMemberPage.Enabled = _pagedReadOnlyMode && !pagedBusy && !pagedCompleted && hasMembers &&
             (long)_pagedMemberOffset + (dgvPagedMembers.Rows.Count) < _pagedCurrentMemberCount;
-        btnPagedConfirmGroup.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy && _pagedKeepCount > 0 && _pagedCandidateCount > 0;
-        btnPagedSkipGroup.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy;
-        btnPagedViewCleanupPlan.Enabled = _pagedReadOnlyMode && _pagedInventory is not null && !pagedBusy;
+        btnPagedConfirmGroup.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy && !pagedCompleted && _pagedKeepCount > 0 && _pagedCandidateCount > 0;
+        btnPagedSkipGroup.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy && !pagedCompleted;
+        btnPagedViewCleanupPlan.Enabled = _pagedReadOnlyMode && _pagedInventory is not null && !pagedBusy && !pagedCompleted;
         btnPagedPrepareGroupPlan.Enabled = _pagedReadOnlyMode && _pagedInventory is not null && hasMembers &&
             _pagedGroupReviewConfirmed && _pagedKeepCount > 0 && _pagedCandidateCount > 0 &&
-            !_pagedReviewWriteInProgress && !_pagedPreflightInProgress && !_pagedLocalPlanPreparationInProgress;
+            !pagedBusy && !pagedCompleted;
+        btnPagedSimulateCleanup.Visible = _demoMode;
+        btnPagedSimulateCleanup.Enabled = _demoMode && _demoPagedCleanupSimulationService is not null &&
+            _pagedReadOnlyMode && _pagedInventory is not null && hasMembers && _pagedGroupReviewConfirmed &&
+            _pagedKeepCount > 0 && _pagedCandidateCount > 0 && !pagedBusy && !pagedCompleted;
         btnPagedCheckDrive.Enabled = _pagedReadOnlyMode && !_demoMode && _driveService is not null &&
-            _pagedInventory is not null && hasMembers && _pagedGroupReviewConfirmed &&
+            _pagedInventory is not null && hasMembers && _pagedGroupReviewConfirmed && !pagedCompleted &&
             _pagedKeepCount > 0 && _pagedCandidateCount > 0 && !pagedBusy;
-        dgvPagedMembers.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy;
+        dgvPagedMembers.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy && !pagedCompleted;
+        dgvPagedGroups.Enabled = _pagedReadOnlyMode && !pagedBusy && !pagedCompleted;
     }
 
     private void CancelPagedQueries() => _pagedRequestGeneration.CancelCurrent();
@@ -1325,6 +1343,74 @@ public partial class Form1 : Form
                 btnConectar.Enabled = !_demoMode;
                 btnBuscar.Enabled = !_demoMode && _driveService is not null;
                 btnReopenLatestScan.Enabled = !_demoMode && _driveService is not null;
+                btnCancelar.Enabled = _searchCancellationTokenSource is not null || _pagedRequestGeneration.HasActiveRequest;
+                UpdatePagedNavigationUi();
+            }
+        }
+    }
+
+    private async void btnPagedSimulateCleanup_Click(object? sender, EventArgs e)
+    {
+        if (!_demoMode || _demoSeed is null || _demoPagedCleanupSimulationService is null ||
+            !_pagedReadOnlyMode || _pagedInventory is null || _activePagedGroup is not DuplicateGroupIdentity identity ||
+            identity.Inventory != _pagedInventory || !_pagedGroupReviewConfirmed ||
+            _pagedKeepCount < 1 || _pagedCandidateCount < 1 || _pagedCleanupSimulationInProgress ||
+            _pagedCleanupSimulationCompleted || _pagedReviewWriteInProgress || _pagedPreflightInProgress ||
+            _pagedLocalPlanPreparationInProgress)
+            return;
+
+        PagedRequestLease request = _pagedRequestGeneration.Begin();
+        _pagedCleanupSimulationInProgress = true;
+        btnCancelar.Enabled = true;
+        lblEstado.Text = "Preparando preflight y ejecución SIMULADOS con transporte local; no se usará OAuth ni Google Drive.";
+        UpdatePagedNavigationUi();
+        bool IsCurrent() => !IsDisposed && !Disposing && _demoMode && _pagedReadOnlyMode &&
+            _pagedRequestGeneration.IsCurrent(request) && _pagedInventory == identity.Inventory &&
+            _activePagedGroup == identity;
+        bool IsSameDemoSelection() => !IsDisposed && !Disposing && _demoMode && _pagedReadOnlyMode &&
+            _pagedInventory == identity.Inventory && _activePagedGroup == identity;
+
+        try
+        {
+            DemoPagedCleanupSimulationResult result = await _demoPagedCleanupSimulationService.RunAsync(
+                identity,
+                (plan, token) =>
+                {
+                    token.ThrowIfCancellationRequested();
+                    if (!IsCurrent()) return Task.FromResult(false);
+                    using var confirmation = new PagedGroupCleanupConfirmationForm(plan);
+                    return Task.FromResult(confirmation.ShowDialog(this) == DialogResult.OK && IsCurrent());
+                },
+                IsCurrent,
+                request.Token);
+
+            if (!IsSameDemoSelection()) return;
+            _pagedCleanupSimulationCompleted = result.Operation is not null;
+            using var resultForm = new PagedGroupCleanupSimulationResultForm(result);
+            resultForm.ShowDialog(this);
+            lblEstado.Text = result.Operation is null
+                ? "Simulación bloqueada o cancelada. No hubo cambios reales en Google Drive."
+                : "Simulación terminada; el resultado solo refleja el transporte local y los datos demo temporales.";
+        }
+        catch (OperationCanceledException) when (request.Token.IsCancellationRequested)
+        {
+            if (!IsDisposed && !Disposing && _pagedRequestGeneration.IsCurrent(request))
+                lblEstado.Text = "Simulación cancelada o sustituida. No hubo cambios reales en Google Drive.";
+        }
+        catch (Exception exception)
+        {
+            if (IsCurrent())
+            {
+                lblEstado.Text = "La simulación local se bloqueó; no hubo acceso ni cambios reales en Google Drive.";
+                MessageBox.Show(exception.Message, "Simulación local bloqueada", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+        finally
+        {
+            _pagedCleanupSimulationInProgress = false;
+            _pagedRequestGeneration.Complete(request);
+            if (!IsDisposed && !Disposing)
+            {
                 btnCancelar.Enabled = _searchCancellationTokenSource is not null || _pagedRequestGeneration.HasActiveRequest;
                 UpdatePagedNavigationUi();
             }

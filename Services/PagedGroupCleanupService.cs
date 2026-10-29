@@ -6,8 +6,8 @@ using Google.Apis.Drive.v3;
 namespace DriveDuplicateFinder.Services;
 
 /// <summary>
-/// Coordinates paged cleanup preparation and execution. Form1 may call only the local-only
-/// preview method; the remote preflight and execution capability methods remain disconnected.
+/// Coordinates paged cleanup preparation and execution. Normal Form1 cleanup actions remain
+/// disconnected; the isolated demo can exercise the coordinator only with its in-memory transport.
 /// </summary>
 public sealed class PagedGroupCleanupService
 {

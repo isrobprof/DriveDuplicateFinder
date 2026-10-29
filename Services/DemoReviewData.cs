@@ -2,6 +2,8 @@ using DriveDuplicateFinder.Data.Sqlite;
 using DriveDuplicateFinder.Data.Sqlite.Repositories;
 using DriveDuplicateFinder.Models;
 using DriveDuplicateFinder.Models.Persistence;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace DriveDuplicateFinder.Services;
 
@@ -10,11 +12,20 @@ public sealed record DemoReviewSeed(string DataDirectory, ScanInventoryIdentity 
 /// <summary>Creates synthetic review data exclusively beneath a unique system-temp directory.</summary>
 public static class DemoReviewData
 {
-    private const string DemoAccountKey = "DEMO-ONLY-NOT-A-GOOGLE-ACCOUNT";
-    private const string DemoScopeKey = "demo-review-only-v1";
+    private const string SyntheticAccountEmail = "demo-review@example.invalid";
+    private static readonly string DemoAccountKey = CreateAccountKey(SyntheticAccountEmail);
+    private const string DemoScopeKey = RecoverableFullScanService.ScopeKeyValue;
 
     public static string CreateTemporaryDirectoryPath() =>
         Path.Combine(Path.GetTempPath(), "DriveDuplicateFinder", "demo-" + Guid.NewGuid().ToString("N"));
+
+    internal static string SyntheticEmailForSimulation => SyntheticAccountEmail;
+
+    public static bool IsValidSimulationSeed(DemoReviewSeed seed) =>
+        seed is not null && !string.IsNullOrWhiteSpace(seed.DataDirectory) && IsIsolatedDemoDirectory(seed.DataDirectory) &&
+        string.Equals(seed.Inventory.AccountKey, DemoAccountKey, StringComparison.Ordinal) &&
+        string.Equals(seed.Inventory.ScopeKey, RecoverableFullScanService.ScopeKeyValue, StringComparison.Ordinal) &&
+        seed.Inventory.ScanId.StartsWith("demo-scan-", StringComparison.Ordinal);
 
     public static async Task<DemoReviewSeed> CreateAsync(string? dataDirectory = null, CancellationToken cancellationToken = default)
     {
@@ -115,7 +126,7 @@ public static class DemoReviewData
                 PagedReadOnlyViewSafety.HasPreviousPage(2) && !PagedReadOnlyViewSafety.HasNextPage(2, 1, 3);
             var check = new DemoReviewCheckResult(
                 !string.Equals(Path.GetFullPath(seed.DataDirectory), Path.GetFullPath(personalDirectory), StringComparison.OrdinalIgnoreCase),
-                seed.Inventory.AccountKey.StartsWith("DEMO-ONLY-", StringComparison.Ordinal),
+                IsValidSimulationSeed(seed),
                 opened.Inventory == seed.Inventory,
                 allGroups.TotalCount == 3 && allGroups.Items.Any(item => item.MemberCount == 205),
                 groupNavigationWorks,
@@ -155,6 +166,12 @@ public static class DemoReviewData
             Path.GetFileName(fullPath).StartsWith("demo-", StringComparison.Ordinal);
     }
 
+    private static string CreateAccountKey(string email) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(email.Trim().ToLowerInvariant())));
+
+    private static DateTimeOffset ToMillisecondPrecision(DateTimeOffset value) =>
+        DateTimeOffset.FromUnixTimeMilliseconds(value.ToUnixTimeMilliseconds());
+
     private static void AddGroup(
         ICollection<DriveFileCacheRecord> records,
         string scanId,
@@ -178,8 +195,8 @@ public static class DemoReviewData
                 MimeType = "application/octet-stream",
                 SizeBytes = size,
                 Md5Checksum = checksum,
-                ModifiedTimeUtc = modifiedAt.AddMinutes(-i),
-                CreatedTimeUtc = modifiedAt.AddYears(-1).AddMinutes(-i),
+                ModifiedTimeUtc = ToMillisecondPrecision(modifiedAt.AddMinutes(-i)),
+                CreatedTimeUtc = ToMillisecondPrecision(modifiedAt.AddYears(-1).AddMinutes(-i)),
                 ParentIds = ["demo-root"],
                 OwnedByMe = true,
                 CanTrash = true,

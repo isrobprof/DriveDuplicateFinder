@@ -40,7 +40,8 @@ static class Program
             GoogleDriveTrashPreflight = await Services.GoogleDriveTrashPreflightLocalChecks.VerifyAsync(),
             PagedGroupCleanup = await Services.PagedGroupCleanupLocalChecks.VerifyAsync(),
             PagedReadOnlyView = Services.PagedReadOnlyViewLocalChecks.Verify(),
-            DemoReviewIsolation = await Services.DemoReviewData.VerifyIsolationAsync()
+            DemoReviewIsolation = await Services.DemoReviewData.VerifyIsolationAsync(),
+            DemoPagedCleanupSimulation = await Services.DemoPagedCleanupSimulationLocalChecks.VerifyAsync()
         };
         Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(
             result,

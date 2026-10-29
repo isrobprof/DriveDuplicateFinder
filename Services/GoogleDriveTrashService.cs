@@ -241,10 +241,10 @@ public sealed class GoogleDriveTrashService
             result.ValidationMessages.Add("La conexión con Google Drive agotó el tiempo de espera; no se completó el preflight.");
             return result;
         }
-        catch (Exception)
+        catch (Exception exception)
         {
             result.FailureKind = CleanupPreflightFailureKind.RemoteFailure;
-            result.ValidationMessages.Add("No se pudo completar la verificación previa. Repite la comprobación.");
+            result.ValidationMessages.Add($"No se pudo completar la verificación previa (fallo técnico {exception.GetType().Name}). Repite la comprobación.");
             return result;
         }
 
