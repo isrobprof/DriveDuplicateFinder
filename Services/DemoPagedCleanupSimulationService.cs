@@ -68,7 +68,7 @@ public sealed class DemoPagedCleanupSimulationService
                 "La solicitud fue sustituida antes de preparar el plan.", Array.Empty<string>(), localRequestCount);
 
         var executionTransport = new DemoOfflineDriveTransport(localPreview.Entries);
-        using var cleanupSession = new CleanupDriveSession(executionTransport.CreateDriveService());
+        using var cleanupSession = new CleanupDriveSession(executionTransport.CreateDriveService(), isOfflineSimulation: true);
         PagedGroupCleanupPlan plan;
         try
         {

@@ -245,6 +245,7 @@ public static class DemoPagedCleanupSimulationLocalChecks
         if (!File.Exists(formPath)) return false;
         string source = File.ReadAllText(formPath);
         string? handler = ExtractHandler(source, "btnPagedSimulateCleanup_Click");
+        string? realHandler = ExtractHandler(source, "btnPagedPrepareCleanup_Click");
         string? updateUi = ExtractHandler(source, "UpdatePagedNavigationUi");
         return handler is not null &&
             handler.Contains("if (!_demoMode || _demoSeed is null || _demoPagedCleanupSimulationService is null", StringComparison.Ordinal) &&
@@ -255,8 +256,12 @@ public static class DemoPagedCleanupSimulationLocalChecks
             !handler.Contains("_cleanupDriveService", StringComparison.Ordinal) &&
             !handler.Contains("ConnectSessionAsync", StringComparison.Ordinal) &&
             !handler.Contains("ExecuteConfirmedAsync", StringComparison.Ordinal) &&
-            !source.Contains("_pagedGroupCleanupService.ExecuteConfirmedAsync", StringComparison.Ordinal) &&
+            realHandler is not null &&
+            realHandler.Contains("if (_demoMode", StringComparison.Ordinal) &&
+            realHandler.Contains("_pagedGroupCleanupService.ExecuteConfirmedAsync", StringComparison.Ordinal) &&
+            realHandler.Contains("PagedGroupCleanupExecutionDisabledException", StringComparison.Ordinal) &&
             source.Contains("btnPagedSimulateCleanup.Visible = _demoMode", StringComparison.Ordinal) &&
+            source.Contains("btnPagedPrepareCleanup.Visible = !_demoMode", StringComparison.Ordinal) &&
             source.Contains("new CleanupHistoryService(_demoDataDirectory is null", StringComparison.Ordinal) &&
             updateUi is not null && updateUi.Contains("!pagedBusy && !pagedCompleted", StringComparison.Ordinal) &&
             updateUi.Contains("_pagedCleanupSimulationInProgress", StringComparison.Ordinal);

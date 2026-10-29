@@ -138,7 +138,7 @@ public static class GoogleDriveTrashPreflightLocalChecks
             {
                 PagedGroupPreflightResult prior = await coordinator.CheckOneGroupAsync(readOnlyDrive, identity, cancellationToken: cancellationToken);
                 var cleanupTransport = new LocalDriveTransport(Email, ResponseScenario.Valid);
-                using var cleanupSession = new CleanupDriveSession(cleanupTransport.CreateDriveService());
+                using var cleanupSession = new CleanupDriveSession(cleanupTransport.CreateDriveService(), isOfflineSimulation: true);
                 var cleanupCoordinator = new PagedGroupCleanupService(scanService, adapter, reviewRepository,
                     new GoogleDriveTrashService(), new CleanupHistoryService(Path.Combine(root, "history")));
                 PagedGroupCleanupPlan plan = await cleanupCoordinator.PreparePlanAsync(cleanupSession, prior, cancellationToken: cancellationToken);
@@ -229,7 +229,7 @@ public static class GoogleDriveTrashPreflightLocalChecks
             PagedGroupPreflightResult approval = await simulatedPreflightCoordinator.CheckOneGroupAsync(
                 readDrive, simulatedIdentity, cancellationToken: cancellationToken);
             var executionTransport = new LocalDriveTransport(Email, ResponseScenario.Valid);
-            using var executionSession = new CleanupDriveSession(executionTransport.CreateDriveService());
+            using var executionSession = new CleanupDriveSession(executionTransport.CreateDriveService(), isOfflineSimulation: true);
             var simulatedCleanup = new PagedGroupCleanupService(simulatedScan, simulatedAdapter, reviewRepository,
                 new GoogleDriveTrashService(), new CleanupHistoryService(Path.Combine(root, "execution-history")));
             PagedGroupCleanupPlan executionPlan = await simulatedCleanup.PreparePlanAsync(

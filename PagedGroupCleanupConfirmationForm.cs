@@ -4,7 +4,7 @@ using DriveDuplicateFinder.Utilities;
 
 namespace DriveDuplicateFinder;
 
-/// <summary>Explicit final confirmation for the offline demo only; it cannot start a real Drive operation.</summary>
+/// <summary>Explicit review of all Keep and candidate IDs before the coordinator's final gate.</summary>
 public sealed class PagedGroupCleanupConfirmationForm : Form
 {
     private readonly CheckBox _keepsReviewed = new()
@@ -22,13 +22,18 @@ public sealed class PagedGroupCleanupConfirmationForm : Form
         AutoSize = true,
         DialogResult = DialogResult.OK,
         Enabled = false,
-        Text = "Confirmar simulación offline"
+        Text = string.Empty
     };
 
-    public PagedGroupCleanupConfirmationForm(PagedGroupCleanupPlan plan)
+    public PagedGroupCleanupConfirmationForm(PagedGroupCleanupPlan plan, bool offlineSimulation)
     {
         ArgumentNullException.ThrowIfNull(plan);
-        Text = "Confirmación explícita — simulación local";
+        Text = offlineSimulation
+            ? "Confirmación explícita — simulación local"
+            : "Confirmación final — ejecución paginada bloqueada";
+        _confirm.Text = offlineSimulation
+            ? "Confirmar simulación offline"
+            : "Confirmar revisión (la escritura está bloqueada)";
         StartPosition = FormStartPosition.CenterParent;
         AutoScaleMode = AutoScaleMode.Dpi;
         AutoScaleDimensions = new SizeF(96F, 96F);
@@ -41,13 +46,15 @@ public sealed class PagedGroupCleanupConfirmationForm : Form
             Dock = DockStyle.Fill,
             ForeColor = Color.DarkRed,
             Font = new Font(SystemFonts.MessageBoxFont ?? SystemFonts.DefaultFont, FontStyle.Bold),
-            Text = "MODO DEMOSTRACIÓN. Confirmar ejecutará el coordinador únicamente contra un transporte HTTP local en memoria. No se iniciará OAuth, no se accederá a Google Drive y no se modificará ningún archivo real."
+            Text = offlineSimulation
+                ? "MODO DEMOSTRACIÓN. Confirmar ejecutará el coordinador únicamente contra un transporte HTTP local en memoria. No se iniciará OAuth, no se accederá a Google Drive y no se modificará ningún archivo real."
+                : "EJECUCIÓN REAL DESHABILITADA EN ESTA VERSIÓN. Esta revisión final puede continuar la revalidación, pero el coordinador rechazará toda sesión real antes de iniciar una escritura. No se enviará ningún archivo a la papelera."
         };
         var identity = new Label
         {
             AutoSize = true,
             Dock = DockStyle.Fill,
-            Text = $"Inventario sintético: {plan.Identity.Inventory.ScanId}{Environment.NewLine}" +
+            Text = $"Inventario: {plan.Identity.Inventory.ScanId}{Environment.NewLine}" +
                    $"Grupo: {plan.Identity.SizeBytes:N0} bytes + MD5 {plan.Identity.NormalizedChecksum}{Environment.NewLine}" +
                    $"Miembros: {plan.LocalReview.MemberCount:N0} | Keep: {plan.KeepFiles.Count:N0} | candidatos: {plan.CandidateFiles.Count:N0} | pendientes excluidos: {plan.LocalReview.UndecidedCount:N0} | potencial: {FileSizeFormatter.Format(new System.Numerics.BigInteger(plan.Identity.SizeBytes) * plan.CandidateFiles.Count)}"
         };

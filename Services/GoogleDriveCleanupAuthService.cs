@@ -54,7 +54,7 @@ public sealed class GoogleDriveCleanupAuthService
     /// This session type is required by the paged single-group cleanup coordinator.
     /// </summary>
     public async Task<CleanupDriveSession> ConnectSessionAsync(CancellationToken cancellationToken = default) =>
-        new(await ConnectAsync(cancellationToken));
+        new(await ConnectAsync(cancellationToken), isOfflineSimulation: false);
 
     public void ResetStoredAuthorization()
     {
@@ -75,10 +75,15 @@ public sealed class GoogleDriveCleanupAuthService
 /// <summary>Capability wrapper proving this DriveService came from the cleanup-scope authorization flow.</summary>
 public sealed class CleanupDriveSession : IDisposable
 {
-    internal CleanupDriveSession(DriveService driveService) =>
+    internal CleanupDriveSession(DriveService driveService, bool isOfflineSimulation = false)
+    {
         DriveService = driveService ?? throw new ArgumentNullException(nameof(driveService));
+        IsOfflineSimulation = isOfflineSimulation;
+    }
 
     internal DriveService DriveService { get; }
+
+    internal bool IsOfflineSimulation { get; }
 
     public void Dispose() => DriveService.Dispose();
 }

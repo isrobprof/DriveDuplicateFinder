@@ -40,7 +40,11 @@ public sealed record PagedGroupCleanupLocalCheckResult(
     bool LocalPreviewRejectsWrongIdentityAndStaleInventory,
     bool LocalPreviewDiscardsObsoleteRequest,
     bool LocalPreviewIsNonExecutableAndRemotePending,
-    bool LocalPreviewUiSurfacesBlocks);
+    bool LocalPreviewUiSurfacesBlocks,
+    bool RealUiBlocksWriteOAuthBeforeConnect,
+    bool ReadOnlyPreflightAndLocalPreparationRemainAvailable,
+    bool RealExecutionBlockedAtCoordinator,
+    bool PagedOutcomesAreSeparated);
 
 /// <summary>Deterministic coordinator and write-outcome checks using temporary SQLite and a local HTTP handler.</summary>
 public static class PagedGroupCleanupLocalChecks
@@ -247,6 +251,54 @@ public static class PagedGroupCleanupLocalChecks
                 cleanup.DriveService.HttpClient.MessageHandler.NumTries == 1;
         }
 
+        bool realExecutionBlockedAtCoordinator = !PagedGroupCleanupService.IsRealExecutionEnabled;
+        await using (TestFixture fixture = await TestFixture.CreateAsync(FixtureKind.Standard, cancellationToken))
+        {
+            using CleanupDriveSession authenticatedSession = fixture.CreateCleanupSession(
+                Email, WriteBehavior.Success, offlineSimulation: false);
+            PagedGroupCleanupPlan plan = await fixture.PreparePlanAsync(authenticatedSession, cancellationToken);
+            PagedGroupCleanupConfirmation confirmation = fixture.Confirm(plan);
+            int requestsBeforeExecute = fixture.TransportFor(authenticatedSession).Requests.Count;
+            bool blocked = false;
+            try
+            {
+                _ = await fixture.Coordinator.ExecuteConfirmedAsync(
+                    authenticatedSession, confirmation, cancellationToken: cancellationToken);
+            }
+            catch (PagedGroupCleanupExecutionDisabledException) { blocked = true; }
+
+            ReviewGroupPersistenceState? reviewState = await fixture.Reviews.GetGroupStateAsync(
+                fixture.Identity, cancellationToken);
+            bool noHistory = !Directory.Exists(Path.Combine(fixture.RootPath, "history"));
+            realExecutionBlockedAtCoordinator &= blocked &&
+                fixture.TransportFor(authenticatedSession).Requests.Count == requestsBeforeExecute &&
+                fixture.TransportFor(authenticatedSession).Requests.All(request => request.Method != HttpMethod.Patch) &&
+                reviewState is { IsReviewConfirmed: true } && noHistory;
+        }
+
+        var outcomeRecord = new CleanupOperationRecord
+        {
+            OperationId = "offline-paged-outcomes",
+            StartedAtUtc = DateTimeOffset.UtcNow,
+            StableGroupId = "synthetic-group",
+            FileSize = Size,
+            Md5Checksum = Hash
+        };
+        outcomeRecord.FileResults.Add(Outcome("confirmed", CleanupFileStatus.Trashed, verified: true));
+        outcomeRecord.FileResults.Add(Outcome("pending-verification", CleanupFileStatus.Trashed, verified: false));
+        outcomeRecord.FileResults.Add(Outcome("failed", CleanupFileStatus.Failed, reason: "RemoteFailure"));
+        outcomeRecord.FileResults.Add(Outcome("uncertain", CleanupFileStatus.Failed, stage: "Files.UpdateOutcomeUncertain", reason: "OutcomeUncertain"));
+        outcomeRecord.FileResults.Add(Outcome("cancelled", CleanupFileStatus.Cancelled));
+        outcomeRecord.FileResults.Add(Outcome("not-processed", CleanupFileStatus.NotProcessed));
+        string outcomeSummary = Form1.BuildPagedCleanupOutcomeSummary(outcomeRecord);
+        bool pagedOutcomesAreSeparated = outcomeSummary.Contains("Confirmados y verificados (1)", StringComparison.Ordinal) &&
+            outcomeSummary.Contains("Pendientes de verificar (1)", StringComparison.Ordinal) &&
+            outcomeSummary.Contains("Fallidos (1)", StringComparison.Ordinal) &&
+            outcomeSummary.Contains("Inciertos (1)", StringComparison.Ordinal) &&
+            outcomeSummary.Contains("Cancelados (1)", StringComparison.Ordinal) &&
+            outcomeSummary.Contains("No procesados (1)", StringComparison.Ordinal) &&
+            outcomeSummary.Contains("No repitas la operación automáticamente", StringComparison.Ordinal);
+
         // Account/scope/session mutations and decision edits happen after a confirmed plan;
         // each invalidation assertion requires rejection before any PATCH is recorded.
         var checks = new PagedGroupCleanupLocalCheckResult(
@@ -259,7 +311,10 @@ public static class PagedGroupCleanupLocalChecks
             noRetriesForFailure && noRetryAfterUncertain && noRetriesForCancellation,
             NoPagedCleanupUiReferences(), localPreviewCompleteCrossPagePlan,
             localPreviewRejectsWrongIdentityAndStaleInventory, localPreviewDiscardsObsoleteRequest,
-            localPreviewIsNonExecutableAndRemotePending, PagedPreviewUiSurfacesBlocks());
+            localPreviewIsNonExecutableAndRemotePending, PagedPreviewUiSurfacesBlocks(),
+            RealUiBlocksWriteOAuthBeforeConnect(), ReadOnlyPreflightAndLocalPreparationRemainAvailable(),
+            realExecutionBlockedAtCoordinator,
+            pagedOutcomesAreSeparated);
 
         Assert(accountChange, "Cambiar AccountKey no rechazó la ejecución antes de PATCH.");
         Assert(scopeChange, "Cambiar ScopeKey no rechazó la ejecución antes de PATCH.");
@@ -282,14 +337,35 @@ public static class PagedGroupCleanupLocalChecks
         Assert(checks.NoRetriesAfterUncertainResponse, "Se reintentó automáticamente una solicitud PATCH cuyo resultado era incierto.");
         Assert(checks.NoRetriesAfterCancellation, "Se emitieron escrituras adicionales después de cancelar entre archivos.");
         Assert(checks.NoAutomaticWriteRetries, "Se reintentó automáticamente una escritura fallida, incierta o cancelada.");
-        Assert(checks.NoWritesFromPagedUi, "Form1 contiene una referencia a la ruta paginada de ejecución de limpieza.");
+        Assert(checks.NoWritesFromPagedUi, "La UI paginada no enruta la ejecución únicamente por el coordinador protegido.");
         Assert(checks.LocalPreviewCompleteCrossPagePlan, "La vista previa local no reconstruyó todas las decisiones repartidas entre páginas o calculó mal los bytes.");
         Assert(checks.LocalPreviewRejectsWrongIdentityAndStaleInventory, "La vista previa aceptó otra cuenta, alcance, sesión o un inventario no vigente.");
         Assert(checks.LocalPreviewDiscardsObsoleteRequest, "Una preparación obsoleta o una confirmación invalidada produjo un plan visible.");
         Assert(checks.LocalPreviewIsNonExecutableAndRemotePending, "La vista previa local adquirió capacidad de ejecución o se presentó como preflight remoto.");
         Assert(checks.LocalPreviewUiSurfacesBlocks, "La interfaz no conecta la preparación local o no presenta los bloqueos del adaptador.");
+        Assert(checks.RealUiBlocksWriteOAuthBeforeConnect,
+            "La UI solicitó OAuth de escritura o abrió confirmación de ejecución con la guarda real cerrada.");
+        Assert(checks.ReadOnlyPreflightAndLocalPreparationRemainAvailable,
+            "El bloqueo de escritura también impidió la preparación local o el preflight de solo lectura.");
+        Assert(checks.RealExecutionBlockedAtCoordinator,
+            "Una sesión real atravesó la guarda cerrada del coordinador o produjo efectos de limpieza.");
+        Assert(checks.PagedOutcomesAreSeparated, "La pantalla de resultado paginado mezcla confirmados, pendientes, fallidos o inciertos.");
         return checks;
     }
+
+    private static CleanupFileResult Outcome(
+        string id,
+        CleanupFileStatus status,
+        bool verified = false,
+        string? stage = null,
+        string? reason = null) => new()
+    {
+        File = new CleanupFileSnapshot { Id = id, Name = id, MimeType = "application/pdf" },
+        Status = status,
+        VerificationSucceeded = verified,
+        FailureStage = stage,
+        FailureReason = reason
+    };
 
     private static async Task<bool> LocalPreviewRejectedAsync(
         TestFixture fixture,
@@ -325,19 +401,70 @@ public static class PagedGroupCleanupLocalChecks
 
     private static bool NoPagedCleanupUiReferences()
     {
-        // Form1 may call only the local preview method; execution stays disconnected.
+        // The normal paged path may call only the single-group coordinator, whose hard gate is closed.
         string sourcePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "Form1.cs"));
         if (!File.Exists(sourcePath) || PagedReadOnlyViewSafety.LegacyActionsEnabled(pagedReadOnlyMode: true)) return false;
         string source = File.ReadAllText(sourcePath);
-        string? handler = ExtractHandler(source, "btnPagedPrepareGroupPlan_Click");
+        string? previewHandler = ExtractHandler(source, "btnPagedPrepareGroupPlan_Click");
+        string? executionHandler = ExtractHandler(source, "btnPagedPrepareCleanup_Click");
+        string coordinatorPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "Services", "PagedGroupCleanupService.cs"));
+        if (!File.Exists(coordinatorPath)) return false;
+        string coordinator = File.ReadAllText(coordinatorPath);
+        int preflightIndex = executionHandler?.IndexOf("_pagedGroupPreflightService.CheckOneGroupAsync", StringComparison.Ordinal) ?? -1;
+        int reportIndex = executionHandler?.IndexOf("new PagedGroupPreflightResultForm", StringComparison.Ordinal) ?? -1;
+        int authIndex = executionHandler?.IndexOf("ConnectSessionAsync", StringComparison.Ordinal) ?? -1;
+        int planIndex = executionHandler?.IndexOf("_pagedGroupCleanupService.PreparePlanAsync", StringComparison.Ordinal) ?? -1;
+        int confirmationIndex = executionHandler?.IndexOf("new PagedGroupCleanupConfirmationForm(plan, offlineSimulation: false)", StringComparison.Ordinal) ?? -1;
+        int executeIndex = executionHandler?.IndexOf("_pagedGroupCleanupService.ExecuteConfirmedAsync", StringComparison.Ordinal) ?? -1;
         return source.Contains("_pagedGroupCleanupService.PrepareLocalPreviewAsync(identity, request.Token)", StringComparison.Ordinal) &&
-            !source.Contains("_pagedGroupCleanupService.ExecuteConfirmedAsync", StringComparison.Ordinal) &&
-            handler is not null &&
-            !handler.Contains("ExecuteConfirmedAsync", StringComparison.Ordinal) &&
-            !handler.Contains("_cleanupBatchService.ExecuteAsync", StringComparison.Ordinal) &&
-            !handler.Contains("_trashService.ExecuteAsync", StringComparison.Ordinal) &&
+            previewHandler is not null && !previewHandler.Contains("ExecuteConfirmedAsync", StringComparison.Ordinal) &&
+            executionHandler is not null &&
+            executionHandler.Contains("PagedGroupCleanupExecutionDisabledException", StringComparison.Ordinal) &&
+            executionHandler.Contains("ShowPagedCleanupOutcome(operation)", StringComparison.Ordinal) &&
+            !executionHandler.Contains("_cleanupBatchService.ExecuteAsync", StringComparison.Ordinal) &&
+            !executionHandler.Contains("_trashService.ExecuteAsync", StringComparison.Ordinal) &&
+            preflightIndex >= 0 && reportIndex > preflightIndex && authIndex > reportIndex &&
+            planIndex > authIndex && confirmationIndex > planIndex && executeIndex > confirmationIndex &&
+            source.Contains("btnPagedPrepareCleanup.Visible = !_demoMode", StringComparison.Ordinal) &&
+            coordinator.Contains("private const bool RealPagedCleanupExecutionEnabled = false", StringComparison.Ordinal) &&
+            coordinator.Contains("!cleanupSession.IsOfflineSimulation && !RealPagedCleanupExecutionEnabled", StringComparison.Ordinal) &&
             HandlerHasPagedGuardBeforeExecution(source, "btnEnviarGruposPapelera_Click", "_cleanupBatchService.ExecuteAsync") &&
             HandlerHasPagedGuardBeforeExecution(source, "btnEnviarGrupoPapelera_Click", "_trashService.ExecuteAsync");
+    }
+
+    private static bool RealUiBlocksWriteOAuthBeforeConnect()
+    {
+        string sourcePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "Form1.cs"));
+        if (!File.Exists(sourcePath)) return false;
+        string? handler = ExtractHandler(File.ReadAllText(sourcePath), "btnPagedPrepareCleanup_Click");
+        if (handler is null) return false;
+        int preflightResultIndex = handler.IndexOf("CheckOneGroupAsync", StringComparison.Ordinal);
+        int resultReviewIndex = handler.IndexOf("new PagedGroupPreflightResultForm", StringComparison.Ordinal);
+        int closedGateIndex = handler.IndexOf("if (!PagedGroupCleanupService.IsRealExecutionEnabled)", StringComparison.Ordinal);
+        int oauthIndex = handler.IndexOf("ConnectSessionAsync", StringComparison.Ordinal);
+        int finalConfirmationIndex = handler.IndexOf("new PagedGroupCleanupConfirmationForm(plan, offlineSimulation: false)", StringComparison.Ordinal);
+        int disabledMessageIndex = handler.IndexOf("executionDisabledMessage =", StringComparison.Ordinal);
+        int returnIndex = handler.IndexOf("return;", closedGateIndex, StringComparison.Ordinal);
+        return preflightResultIndex >= 0 && resultReviewIndex > preflightResultIndex &&
+            closedGateIndex > resultReviewIndex && disabledMessageIndex > closedGateIndex &&
+            handler.Contains("No se solicitará OAuth de escritura", StringComparison.Ordinal) &&
+            returnIndex > disabledMessageIndex && oauthIndex > returnIndex &&
+            finalConfirmationIndex > oauthIndex &&
+            handler.Contains("MessageBox.Show(executionDisabledMessage", StringComparison.Ordinal);
+    }
+
+    private static bool ReadOnlyPreflightAndLocalPreparationRemainAvailable()
+    {
+        string sourcePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "Form1.cs"));
+        if (!File.Exists(sourcePath)) return false;
+        string source = File.ReadAllText(sourcePath);
+        string? localPreparationHandler = ExtractHandler(source, "btnPagedPrepareGroupPlan_Click");
+        string? preflightHandler = ExtractHandler(source, "btnPagedCheckDrive_Click");
+        return localPreparationHandler is not null &&
+            localPreparationHandler.Contains("PrepareLocalPreviewAsync", StringComparison.Ordinal) &&
+            preflightHandler is not null &&
+            preflightHandler.Contains("CheckOneGroupAsync", StringComparison.Ordinal) &&
+            preflightHandler.Contains("DriveMetadataReadonly", StringComparison.Ordinal);
     }
 
     private static bool PagedPreviewUiSurfacesBlocks()
@@ -455,10 +582,12 @@ public static class PagedGroupCleanupLocalChecks
             }
         }
 
-        public CleanupDriveSession CreateCleanupSession(string email, WriteBehavior behavior)
+        public string RootPath => _root;
+
+        public CleanupDriveSession CreateCleanupSession(string email, WriteBehavior behavior, bool offlineSimulation = true)
         {
             var transport = new LocalTransport(email, behavior);
-            var session = new CleanupDriveSession(transport.CreateDrive());
+            var session = new CleanupDriveSession(transport.CreateDrive(), isOfflineSimulation: offlineSimulation);
             _transports.Add(session, transport);
             return session;
         }

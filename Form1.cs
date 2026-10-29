@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.ComponentModel;
 using System.Globalization;
+using System.Text;
 using DriveDuplicateFinder.Data.Sqlite;
 using DriveDuplicateFinder.Data.Sqlite.Repositories;
 using DriveDuplicateFinder.Models;
@@ -82,6 +83,7 @@ public partial class Form1 : Form
     private bool _pagedLocalPlanPreparationInProgress;
     private bool _pagedCleanupSimulationInProgress;
     private bool _pagedCleanupSimulationCompleted;
+    private bool _pagedRealCleanupPreparationInProgress;
     private bool _pagedGroupReviewConfirmed;
 
     private readonly GroupBox grpFiltros = new();
@@ -143,6 +145,7 @@ public partial class Form1 : Form
     private readonly Button btnPagedPrepareGroupPlan = new();
     private readonly Button btnPagedSimulateCleanup = new();
     private readonly Button btnPagedCheckDrive = new();
+    private readonly Button btnPagedPrepareCleanup = new();
     private readonly Button btnReopenLatestScan = new();
     private const int PagedGroupPageSize = 1;
     private const int PagedMemberPageSize = 100;
@@ -769,9 +772,11 @@ public partial class Form1 : Form
         ConfigureButton(btnPagedSimulateCleanup, "Simular flujo completo (solo demo)", btnPagedSimulateCleanup_Click);
         btnPagedSimulateCleanup.Visible = _demoMode;
         ConfigureButton(btnPagedCheckDrive, "Comprobar en Google Drive", btnPagedCheckDrive_Click);
+        ConfigureButton(btnPagedPrepareCleanup, "Preparar limpieza paginada (escritura bloqueada)", btnPagedPrepareCleanup_Click);
+        btnPagedPrepareCleanup.Visible = !_demoMode;
         lblPagedMembersPage.AutoSize = true;
         lblPagedMembersPage.Padding = new Padding(4, 6, 0, 0);
-        memberNavigation.Controls.AddRange([btnPagedPreviousMemberPage, btnPagedNextMemberPage, btnPagedConfirmGroup, btnPagedSkipGroup, btnPagedPrepareGroupPlan, btnPagedSimulateCleanup, btnPagedViewCleanupPlan, btnPagedCheckDrive, lblPagedMembersPage]);
+        memberNavigation.Controls.AddRange([btnPagedPreviousMemberPage, btnPagedNextMemberPage, btnPagedConfirmGroup, btnPagedSkipGroup, btnPagedPrepareGroupPlan, btnPagedSimulateCleanup, btnPagedViewCleanupPlan, btnPagedCheckDrive, btnPagedPrepareCleanup, lblPagedMembersPage]);
         var reviewNotice = new Label
         {
             AutoSize = true,
@@ -1070,7 +1075,7 @@ public partial class Form1 : Form
         bool groupPageLoaded = _pagedGroupPage is not null;
         lblPagedGroupPage.Text = _pagedReadOnlyMode ? range : string.Empty;
         bool pagedBusy = _pagedReviewWriteInProgress || _pagedPreflightInProgress ||
-            _pagedLocalPlanPreparationInProgress || _pagedCleanupSimulationInProgress;
+            _pagedLocalPlanPreparationInProgress || _pagedCleanupSimulationInProgress || _pagedRealCleanupPreparationInProgress;
         bool pagedCompleted = _pagedCleanupSimulationCompleted;
         btnPagedPreviousGroupPage.Enabled = _pagedReadOnlyMode && !pagedBusy && !pagedCompleted && groupPageLoaded && PagedReadOnlyViewSafety.HasPreviousPage(_pagedGroupOffset);
         btnPagedNextGroupPage.Enabled = _pagedReadOnlyMode && !pagedBusy && !pagedCompleted && groupPageLoaded &&
@@ -1091,6 +1096,10 @@ public partial class Form1 : Form
             _pagedReadOnlyMode && _pagedInventory is not null && hasMembers && _pagedGroupReviewConfirmed &&
             _pagedKeepCount > 0 && _pagedCandidateCount > 0 && !pagedBusy && !pagedCompleted;
         btnPagedCheckDrive.Enabled = _pagedReadOnlyMode && !_demoMode && _driveService is not null &&
+            _pagedInventory is not null && hasMembers && _pagedGroupReviewConfirmed && !pagedCompleted &&
+            _pagedKeepCount > 0 && _pagedCandidateCount > 0 && !pagedBusy;
+        btnPagedPrepareCleanup.Visible = !_demoMode;
+        btnPagedPrepareCleanup.Enabled = _pagedReadOnlyMode && !_demoMode && _driveService is not null &&
             _pagedInventory is not null && hasMembers && _pagedGroupReviewConfirmed && !pagedCompleted &&
             _pagedKeepCount > 0 && _pagedCandidateCount > 0 && !pagedBusy;
         dgvPagedMembers.Enabled = _pagedReadOnlyMode && hasMembers && !pagedBusy && !pagedCompleted;
@@ -1378,7 +1387,7 @@ public partial class Form1 : Form
                 {
                     token.ThrowIfCancellationRequested();
                     if (!IsCurrent()) return Task.FromResult(false);
-                    using var confirmation = new PagedGroupCleanupConfirmationForm(plan);
+                    using var confirmation = new PagedGroupCleanupConfirmationForm(plan, offlineSimulation: true);
                     return Task.FromResult(confirmation.ShowDialog(this) == DialogResult.OK && IsCurrent());
                 },
                 IsCurrent,
@@ -1420,6 +1429,137 @@ public partial class Form1 : Form
     private bool IsCurrentPagedPreflight(PagedRequestLease request, DuplicateGroupIdentity identity) =>
         !_demoMode && _pagedRequestGeneration.IsCurrent(request) && _pagedReadOnlyMode &&
         _pagedInventory == identity.Inventory && _activePagedGroup == identity;
+
+    private async void btnPagedPrepareCleanup_Click(object? sender, EventArgs e)
+    {
+        if (_demoMode || !_pagedReadOnlyMode || _driveService is null || _pagedInventory is null ||
+            _activePagedGroup is not DuplicateGroupIdentity identity || identity.Inventory != _pagedInventory ||
+            !_pagedGroupReviewConfirmed || _pagedKeepCount < 1 || _pagedCandidateCount < 1 ||
+            _pagedRealCleanupPreparationInProgress || _pagedReviewWriteInProgress || _pagedPreflightInProgress ||
+            _pagedLocalPlanPreparationInProgress || _pagedCleanupSimulationInProgress)
+            return;
+
+        PagedRequestLease request = _pagedRequestGeneration.Begin();
+        _pagedRealCleanupPreparationInProgress = true;
+        btnConectar.Enabled = false;
+        btnBuscar.Enabled = false;
+        btnReopenLatestScan.Enabled = false;
+        btnCancelar.Enabled = true;
+        lblEstado.Text = "Preparando un único grupo. La ejecución real permanece bloqueada en el coordinador.";
+        UpdatePagedNavigationUi();
+
+        try
+        {
+            var progress = new Progress<string>(message =>
+            {
+                if (IsCurrentPagedPreflight(request, identity)) lblEstado.Text = message;
+            });
+            PagedGroupPreflightResult readOnlyPreflight = await _pagedGroupPreflightService.CheckOneGroupAsync(
+                _driveService, identity, progress, request.Token);
+            if (!IsCurrentPagedPreflight(request, identity)) return;
+            if (readOnlyPreflight.IsStale || !readOnlyPreflight.Preflight.IsSuccessful || request.Token.IsCancellationRequested)
+            {
+                using var blocked = new PagedGroupPreflightResultForm(
+                    readOnlyPreflight.LocalReview, readOnlyPreflight.Preflight, readOnlyPreflight.RemoteFileReadsStarted);
+                blocked.ShowDialog(this);
+                lblEstado.Text = "La revisión/preflight no es vigente o no fue aprobado. No se solicitó autorización de limpieza y no se ejecutó ninguna escritura.";
+                return;
+            }
+
+            // This read-only result shows every Keep and explicit candidate before requesting the separate Drive scope.
+            using (var review = new PagedGroupPreflightResultForm(
+                       readOnlyPreflight.LocalReview, readOnlyPreflight.Preflight, readOnlyPreflight.RemoteFileReadsStarted))
+                review.ShowDialog(this);
+            if (!IsCurrentPagedPreflight(request, identity) || request.Token.IsCancellationRequested) return;
+
+            if (!PagedGroupCleanupService.IsRealExecutionEnabled)
+            {
+                const string executionDisabledMessage =
+                    "El preflight de solo lectura está disponible, pero la ejecución real de limpieza paginada aún está deshabilitada. No se solicitará OAuth de escritura ni se enviarán cambios a Google Drive.";
+                lblEstado.Text = executionDisabledMessage;
+                MessageBox.Show(executionDisabledMessage, "Ejecución real deshabilitada",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (MessageBox.Show(
+                    "El preflight de solo lectura está aprobado para este grupo. ¿Quieres solicitar ahora la autorización OAuth independiente con alcance Drive para preparar la confirmación final? La ejecución real está bloqueada en esta versión y no se enviarán archivos a la papelera.",
+                    "Autorización independiente — limpieza paginada bloqueada",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning) != DialogResult.Yes)
+            {
+                lblEstado.Text = "No se solicitó autorización de limpieza. No se ejecutó ninguna escritura.";
+                return;
+            }
+
+            using CleanupDriveSession cleanupSession = await new GoogleDriveCleanupAuthService()
+                .ConnectSessionAsync(request.Token);
+            if (!IsCurrentPagedPreflight(request, identity) || request.Token.IsCancellationRequested) return;
+
+            PagedGroupCleanupPlan plan = await _pagedGroupCleanupService.PreparePlanAsync(
+                cleanupSession, readOnlyPreflight, progress, request.Token);
+            if (!IsCurrentPagedPreflight(request, identity) || request.Token.IsCancellationRequested) return;
+
+            using var finalConfirmation = new PagedGroupCleanupConfirmationForm(plan, offlineSimulation: false);
+            if (finalConfirmation.ShowDialog(this) != DialogResult.OK ||
+                !IsCurrentPagedPreflight(request, identity) || request.Token.IsCancellationRequested)
+            {
+                lblEstado.Text = "Confirmación final cancelada u obsoleta. No se ejecutó ninguna escritura.";
+                return;
+            }
+
+            PagedGroupCleanupConfirmation confirmation = _pagedGroupCleanupService.ConfirmPlan(
+                plan,
+                plan.KeepFiles.Select(file => file.Id),
+                plan.CandidateFiles.Select(file => file.Id));
+            var operationProgress = new Progress<(int Current, int Total, string Name)>(item =>
+            {
+                if (IsCurrentPagedPreflight(request, identity))
+                    lblEstado.Text = $"Coordinador: archivo {item.Current:N0} de {item.Total:N0}; la guarda de escritura sigue deshabilitada.";
+            });
+            CleanupOperationResult operation = await _pagedGroupCleanupService.ExecuteConfirmedAsync(
+                cleanupSession, confirmation, operationProgress, request.Token,
+                stopAfterCurrentFileRequested: () => request.Token.IsCancellationRequested);
+
+            if (!IsCurrentPagedPreflight(request, identity)) return;
+            if (operation.ShouldInvalidateScan) InvalidateResultsAfterDriveChange();
+            ShowPagedCleanupOutcome(operation);
+        }
+        catch (PagedGroupCleanupExecutionDisabledException exception)
+        {
+            if (IsCurrentPagedPreflight(request, identity))
+            {
+                lblEstado.Text = "Bloqueo de seguridad: la ejecución real paginada no está habilitada; no se ejecutó ninguna escritura.";
+                MessageBox.Show(exception.Message, "Ejecución bloqueada", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+        catch (OperationCanceledException) when (request.Token.IsCancellationRequested)
+        {
+            if (!IsDisposed && !Disposing) lblEstado.Text = "Preparación cancelada; la ejecución real paginada continúa bloqueada.";
+        }
+        catch (Exception exception)
+        {
+            if (IsCurrentPagedPreflight(request, identity))
+            {
+                lblEstado.Text = "La preparación se bloqueó. No se ejecutó ninguna escritura.";
+                MessageBox.Show(DescribeReadOnlyPreflightFailure(exception),
+                    "Preparación paginada bloqueada", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+        finally
+        {
+            _pagedRealCleanupPreparationInProgress = false;
+            _pagedRequestGeneration.Complete(request);
+            if (!IsDisposed && !Disposing)
+            {
+                btnConectar.Enabled = !_demoMode;
+                btnBuscar.Enabled = !_demoMode && _driveService is not null;
+                btnReopenLatestScan.Enabled = !_demoMode && _driveService is not null;
+                btnCancelar.Enabled = _searchCancellationTokenSource is not null || _pagedRequestGeneration.HasActiveRequest;
+                UpdatePagedNavigationUi();
+            }
+        }
+    }
 
     private static string DescribeReadOnlyPreflightFailure(Exception exception) => exception switch
     {
@@ -3412,6 +3552,47 @@ public partial class Form1 : Form
     private sealed record ReviewStatusFilterOption(string DisplayName, DuplicateGroupReviewStatus? Status);
 
     private bool IsLegacyActionsAllowed => PagedReadOnlyViewSafety.LegacyActionsEnabled(_pagedReadOnlyMode, demoMode: _demoMode);
+
+    private void ShowPagedCleanupOutcome(CleanupOperationResult operation)
+    {
+        string summary = BuildPagedCleanupOutcomeSummary(operation.Record);
+        lblEstado.Text = $"Resultado del coordinador paginado: {operation.Record.Status}. Revisa los estados por archivo antes de continuar.";
+        MessageBox.Show(summary, "Resultado de limpieza paginada", MessageBoxButtons.OK,
+            operation.Record.Status == CleanupOperationStatus.Completed ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+    }
+
+    internal static string BuildPagedCleanupOutcomeSummary(CleanupOperationRecord record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        static bool IsUncertain(CleanupFileResult file) =>
+            file.FailureReason == "OutcomeUncertain" || file.FailureStage == "Files.UpdateOutcomeUncertain";
+        static string Names(IEnumerable<CleanupFileResult> files)
+        {
+            CleanupFileResult[] items = files.ToArray();
+            string preview = string.Join(", ", items.Take(20).Select(file => $"{file.File.Name} [{file.File.Id}]"));
+            return items.Length <= 20 ? preview : $"{preview}, … y {items.Length - 20:N0} más (ver historial)";
+        }
+        CleanupFileResult[] confirmedFiles = record.FileResults.Where(file =>
+            !IsUncertain(file) && file.Status == CleanupFileStatus.Trashed && file.VerificationSucceeded).ToArray();
+        CleanupFileResult[] pendingVerificationFiles = record.FileResults.Where(file =>
+            !IsUncertain(file) && file.Status == CleanupFileStatus.Trashed && !file.VerificationSucceeded).ToArray();
+        CleanupFileResult[] failedFiles = record.FileResults.Where(file =>
+            file.Status == CleanupFileStatus.Failed && !IsUncertain(file)).ToArray();
+        CleanupFileResult[] uncertainFiles = record.FileResults.Where(IsUncertain).ToArray();
+        CleanupFileResult[] cancelledFiles = record.FileResults.Where(file => file.Status == CleanupFileStatus.Cancelled).ToArray();
+        CleanupFileResult[] notProcessedFiles = record.FileResults.Where(file =>
+            file.Status is CleanupFileStatus.NotProcessed or CleanupFileStatus.Pending).ToArray();
+        var output = new StringBuilder();
+        output.AppendLine($"Confirmados y verificados ({confirmedFiles.Length}): {Names(confirmedFiles)}");
+        output.AppendLine($"Pendientes de verificar ({pendingVerificationFiles.Length}): {Names(pendingVerificationFiles)}");
+        output.AppendLine($"Fallidos ({failedFiles.Length}): {Names(failedFiles)}");
+        output.AppendLine($"Inciertos ({uncertainFiles.Length}): {Names(uncertainFiles)}");
+        output.AppendLine($"Cancelados ({cancelledFiles.Length}): {Names(cancelledFiles)}");
+        output.AppendLine($"No procesados ({notProcessedFiles.Length}): {Names(notProcessedFiles)}");
+        if (uncertainFiles.Length > 0)
+            output.AppendLine("Un resultado incierto no es éxito ni fallo seguro para reintentar. No repitas la operación automáticamente; reconcilia el estado remoto primero.");
+        return output.ToString();
+    }
 
     private sealed record PagedGroupDisplayRow(
         DuplicateGroupIdentity Identity,

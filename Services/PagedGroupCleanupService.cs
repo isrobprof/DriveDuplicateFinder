@@ -11,12 +11,16 @@ namespace DriveDuplicateFinder.Services;
 /// </summary>
 public sealed class PagedGroupCleanupService
 {
+    private const bool RealPagedCleanupExecutionEnabled = false;
     private readonly Guid _owner = Guid.NewGuid();
     private readonly RecoverableFullScanService _scan;
     private readonly PersistedCleanupGroupReviewAdapter _adapter;
     private readonly ReviewStateRepository _reviews;
     private readonly GoogleDriveTrashService _trash;
     private readonly CleanupHistoryService _history;
+
+    /// <summary>Hard, code-controlled gate. No UI setting or command-line argument can enable writes.</summary>
+    public static bool IsRealExecutionEnabled => RealPagedCleanupExecutionEnabled;
 
     public PagedGroupCleanupService(
         RecoverableFullScanService scan,
@@ -153,8 +157,8 @@ public sealed class PagedGroupCleanupService
     }
 
     /// <summary>
-    /// Executes only a single-group confirmation token. No current UI calls this method.
-    /// The local snapshot is atomically checked and invalidated before the existing trash service is invoked.
+    /// Executes only a single-group confirmation token. Real authenticated sessions are blocked by default;
+    /// only explicitly marked in-memory simulation sessions may exercise the coordinator while the gate is closed.
     /// </summary>
     public async Task<CleanupOperationResult> ExecuteConfirmedAsync(
         CleanupDriveSession cleanupSession,
@@ -167,6 +171,9 @@ public sealed class PagedGroupCleanupService
         ArgumentNullException.ThrowIfNull(confirmation);
         if (confirmation.Owner != _owner || !confirmation.TryConsume())
             throw new InvalidOperationException("La confirmación no pertenece a este servicio o ya fue utilizada.");
+
+        if (!cleanupSession.IsOfflineSimulation && !RealPagedCleanupExecutionEnabled)
+            throw new PagedGroupCleanupExecutionDisabledException();
 
         PagedGroupCleanupPlan plan = confirmation.Plan;
         if (!confirmation.KeepIds.OrderBy(id => id, StringComparer.Ordinal)
@@ -265,6 +272,14 @@ public sealed class PagedGroupCleanupService
     {
         ArgumentNullException.ThrowIfNull(plan);
         if (plan.Owner != _owner) throw new InvalidOperationException("El plan pertenece a otra sesión de servicio.");
+    }
+}
+
+public sealed class PagedGroupCleanupExecutionDisabledException : InvalidOperationException
+{
+    public PagedGroupCleanupExecutionDisabledException()
+        : base("La ejecución real de limpieza paginada está deshabilitada en esta versión. No se inició ninguna escritura.")
+    {
     }
 }
 
